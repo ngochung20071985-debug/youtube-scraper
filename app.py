@@ -1,5 +1,14 @@
 # app.py
-# -*- coding: utf-8 -*-
+# Frontend-only Streamlit (Supabase)
+# - No sqlite3
+# - No YouTube API calls
+# - Uses st.secrets for Supabase URL/key
+#
+# Expected channels schema (as you said):
+# channels: id, channel_id, title, handle, avatar_url, subscribers, created_at
+#
+# videos/snapshots can vary: we SELECT * and normalize safely.
+
 from __future__ import annotations
 
 import re
@@ -10,15 +19,20 @@ import pandas as pd
 import streamlit as st
 from supabase import create_client, Client
 
-APP_TITLE = "ToolWatch • NexLev-style (Supabase)"
+
+APP_TITLE = "toolwatch • NexLev-style (Supabase)"
 YOUTUBE_WATCH = "https://www.youtube.com/watch?v="
 
 
-# =========================
+# -------------------------
 # Helpers
-# =========================
+# -------------------------
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return utc_now().isoformat()
 
 
 def to_int(x: Any) -> int:
@@ -39,61 +53,55 @@ def fmt_num(n: int) -> str:
     return str(n)
 
 
-def time_ago_vi(iso: str) -> str:
-    iso = (iso or "").strip()
-    if not iso:
-        return ""
-    try:
-        if iso.endswith("Z"):
-            iso = iso.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(iso)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        sec = int((now - dt.astimezone(timezone.utc)).total_seconds())
-        if sec < 60:
-            return "vừa xong"
-        if sec < 3600:
-            return f"{sec//60} phút trước"
-        if sec < 86400:
-            return f"{sec//3600} giờ trước"
-        days = sec // 86400
-        if days < 30:
-            return f"{days} ngày trước"
-        months = days // 30
-        if months < 12:
-            return f"{months} tháng trước"
-        years = months // 12
-        return f"{years} năm trước"
-    except Exception:
-        return ""
+def safe_str(x: Any) -> str:
+    return "" if x is None else str(x)
 
 
-def extract_channel_id(user_input: str) -> Optional[str]:
-    """
-    Frontend KHÔNG gọi YouTube API => chỉ chấp nhận:
-    - UC... (channel_id)
-    - URL dạng /channel/UC...
-    """
-    s = (user_input or "").strip()
+def parse_dt_any(s: str) -> Optional[datetime]:
+    s = (s or "").strip()
     if not s:
         return None
-    if re.fullmatch(r"UC[a-zA-Z0-9_-]{20,}", s):
-        return s
-    m = re.search(r"/channel/(UC[a-zA-Z0-9_-]{20,})", s)
-    if m:
-        return m.group(1)
-    return None
+    try:
+        if s.endswith("Z"):
+            s = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
 
 
-def ensure_columns(df: pd.DataFrame, defaults: Dict[str, Any]) -> pd.DataFrame:
-    for col, default in defaults.items():
-        if col not in df.columns:
-            df[col] = default
+def time_ago_vi(iso: str) -> str:
+    dt = parse_dt_any(iso)
+    if not dt:
+        return ""
+    sec = int((utc_now() - dt).total_seconds())
+    if sec < 60:
+        return "vừa xong"
+    if sec < 3600:
+        return f"{sec//60} phút trước"
+    if sec < 86400:
+        return f"{sec//3600} giờ trước"
+    days = sec // 86400
+    if days < 30:
+        return f"{days} ngày trước"
+    months = days // 30
+    if months < 12:
+        return f"{months} tháng trước"
+    years = months // 12
+    return f"{years} năm trước"
+
+
+def ensure_df_columns(df: pd.DataFrame, cols_defaults: Dict[str, Any]) -> pd.DataFrame:
+    # df may be empty; still create columns
+    for c, d in cols_defaults.items():
+        if c not in df.columns:
+            df[c] = d
     return df
 
 
-def coerce_int_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+def coerce_int(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     for c in cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
@@ -107,45 +115,91 @@ def is_shorts(duration_sec: Any) -> bool:
         return False
 
 
-def get_query_params() -> Dict[str, List[str]]:
-    # tương thích nhiều phiên bản streamlit
-    try:
-        return st.experimental_get_query_params()
-    except Exception:
-        try:
-            # streamlit mới: st.query_params
-            qp = dict(st.query_params)  # type: ignore
-            # normalize to list[str]
-            out: Dict[str, List[str]] = {}
-            for k, v in qp.items():
-                if isinstance(v, list):
-                    out[k] = [str(x) for x in v]
-                else:
-                    out[k] = [str(v)]
-            return out
-        except Exception:
-            return {}
+def extract_channel_input(s: str) -> Dict[str, Optional[str]]:
+    """
+    Accept:
+    - UC... (channel_id)
+    - https://youtube.com/channel/UC...
+    - @handle
+    - https://youtube.com/@handle
+    """
+    s = (s or "").strip()
+    if not s:
+        return {"channel_id": None, "handle": None}
+
+    # channel_id
+    if re.fullmatch(r"UC[a-zA-Z0-9_-]{20,}", s):
+        return {"channel_id": s, "handle": None}
+
+    m = re.search(r"/channel/(UC[a-zA-Z0-9_-]{20,})", s)
+    if m:
+        return {"channel_id": m.group(1), "handle": None}
+
+    # handle
+    if s.startswith("@") and len(s) >= 2:
+        return {"channel_id": None, "handle": s}
+
+    m2 = re.search(r"youtube\.com/@([A-Za-z0-9._-]{2,})", s)
+    if m2:
+        return {"channel_id": None, "handle": "@" + m2.group(1)}
+
+    return {"channel_id": None, "handle": None}
 
 
-# =========================
-# Supabase
-# =========================
+def detect_vietnamese(text: str) -> bool:
+    # heuristic: Vietnamese diacritics
+    return bool(re.search(r"[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]", text.lower()))
+
+
+def guess_lang_from_titles(titles: List[str]) -> str:
+    if not titles:
+        return "unknown"
+    vi = 0
+    en = 0
+    for t in titles[:200]:
+        t = (t or "").strip()
+        if not t:
+            continue
+        if detect_vietnamese(t):
+            vi += 1
+        # crude: ascii-heavy -> "en"
+        if re.fullmatch(r"[\x00-\x7F]+", t):
+            en += 1
+    if vi >= max(3, en):
+        return "vi"
+    if en >= max(3, vi):
+        return "en"
+    return "mixed"
+
+
+# -------------------------
+# Supabase client (secrets)
+# -------------------------
 @st.cache_resource
 def supa() -> Client:
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]
+    try:
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]
+    except Exception:
+        # show friendly error in UI
+        st.stop()
     return create_client(url, key)
 
 
-# =========================
-# SELECT (robust, DB trống vẫn chạy)
-# =========================
+def secrets_ok() -> bool:
+    try:
+        _ = st.secrets["SUPABASE_URL"]
+        _ = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]
+        return True
+    except Exception:
+        return False
+
+
+# -------------------------
+# SELECTs (safe when DB empty)
+# -------------------------
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_channels() -> pd.DataFrame:
-    """
-    channels schema:
-    id, channel_id, title, handle, avatar_url, subscribers, created_at
-    """
     client = supa()
     res = (
         client.table("channels")
@@ -157,7 +211,7 @@ def fetch_channels() -> pd.DataFrame:
     if df.empty:
         df = pd.DataFrame(columns=["id", "channel_id", "title", "handle", "avatar_url", "subscribers", "created_at"])
 
-    df = ensure_columns(
+    df = ensure_df_columns(
         df,
         {
             "id": None,
@@ -169,18 +223,21 @@ def fetch_channels() -> pd.DataFrame:
             "created_at": "",
         },
     )
-    df = coerce_int_cols(df, ["subscribers"])
+    df = coerce_int(df, ["subscribers"])
     return df
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_latest_videos(limit: int = 120) -> pd.DataFrame:
+def fetch_videos(limit: int = 120) -> pd.DataFrame:
     """
-    videos: schema có thể khác nhau => select('*') để không crash.
+    videos schema may differ -> SELECT *.
+    normalize minimal columns needed for UI.
     """
     client = supa()
+
+    # Try ordering by common timestamp columns, fallback to no order
     res = None
-    for col in ("published_at", "created_at", None):
+    for col in ("published_at", "created_at", "updated_at", None):
         try:
             q = client.table("videos").select("*").limit(int(limit))
             if col:
@@ -192,26 +249,25 @@ def fetch_latest_videos(limit: int = 120) -> pd.DataFrame:
 
     df = pd.DataFrame((res.data if res else []) or [])
     if df.empty:
-        df = pd.DataFrame(
-            columns=["video_id", "channel_id", "title", "published_at", "created_at", "thumb_url", "duration_sec", "url"]
-        )
+        df = pd.DataFrame(columns=["video_id", "channel_id", "title", "thumb_url", "url", "duration_sec", "published_at", "created_at", "updated_at"])
 
-    df = ensure_columns(
+    df = ensure_df_columns(
         df,
         {
             "video_id": "",
             "channel_id": "",
             "title": "",
+            "thumb_url": "",
+            "url": "",
+            "duration_sec": 0,
             "published_at": "",
             "created_at": "",
-            "thumb_url": "",
-            "duration_sec": 0,
-            "url": "",
+            "updated_at": "",
         },
     )
-    df = coerce_int_cols(df, ["duration_sec"])
+    df = coerce_int(df, ["duration_sec"])
 
-    # url fallback
+    # URL fallback
     empty_url = df["url"].astype(str).str.strip().eq("") | df["url"].isna()
     df.loc[empty_url, "url"] = YOUTUBE_WATCH + df["video_id"].astype(str)
 
@@ -219,10 +275,10 @@ def fetch_latest_videos(limit: int = 120) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_latest_snapshots_for_videos(video_ids: List[str]) -> pd.DataFrame:
+def fetch_latest_video_snapshots(video_ids: List[str]) -> pd.DataFrame:
     """
-    snapshots(video metrics): kỳ vọng có video_id + view_count (+ like/comment optional)
-    Nếu schema khác -> trả empty, không crash.
+    snapshots may contain video metrics (video_id + view_count).
+    If not compatible, return empty without crashing.
     """
     if not video_ids:
         return pd.DataFrame(columns=["video_id", "captured_at", "view_count", "like_count", "comment_count"])
@@ -244,13 +300,14 @@ def fetch_latest_snapshots_for_videos(video_ids: List[str]) -> pd.DataFrame:
             )
             rows.extend(r.data or [])
         except Exception:
+            # snapshots doesn't have video_id or permission issue
             continue
 
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(columns=["video_id", "captured_at", "view_count", "like_count", "comment_count"])
 
-    df = ensure_columns(
+    df = ensure_df_columns(
         df,
         {
             "video_id": "",
@@ -264,22 +321,22 @@ def fetch_latest_snapshots_for_videos(video_ids: List[str]) -> pd.DataFrame:
         },
     )
 
-    # canonical metrics
-    df["view_count"] = pd.to_numeric(df["view_count"], errors="coerce")
-    df["view_count"] = df["view_count"].fillna(pd.to_numeric(df["views"], errors="coerce")).fillna(0)
+    # canonical numeric
+    vc = pd.to_numeric(df["view_count"], errors="coerce")
+    vc2 = pd.to_numeric(df["views"], errors="coerce")
+    df["view_count"] = vc.fillna(vc2).fillna(0).astype(int)
 
-    df["like_count"] = pd.to_numeric(df["like_count"], errors="coerce")
-    df["like_count"] = df["like_count"].fillna(pd.to_numeric(df["likes"], errors="coerce")).fillna(0)
+    lc = pd.to_numeric(df["like_count"], errors="coerce")
+    lc2 = pd.to_numeric(df["likes"], errors="coerce")
+    df["like_count"] = lc.fillna(lc2).fillna(0).astype(int)
 
-    df["comment_count"] = pd.to_numeric(df["comment_count"], errors="coerce")
-    df["comment_count"] = df["comment_count"].fillna(pd.to_numeric(df["comments"], errors="coerce")).fillna(0)
+    cc = pd.to_numeric(df["comment_count"], errors="coerce")
+    cc2 = pd.to_numeric(df["comments"], errors="coerce")
+    df["comment_count"] = cc.fillna(cc2).fillna(0).astype(int)
 
-    df["view_count"] = df["view_count"].astype(int)
-    df["like_count"] = df["like_count"].astype(int)
-    df["comment_count"] = df["comment_count"].astype(int)
+    df["video_id"] = df["video_id"].astype(str)
 
     # newest per video_id
-    df["video_id"] = df["video_id"].astype(str)
     latest: Dict[str, Dict[str, Any]] = {}
     for _, r in df.iterrows():
         vid = str(r["video_id"] or "")
@@ -287,38 +344,104 @@ def fetch_latest_snapshots_for_videos(video_ids: List[str]) -> pd.DataFrame:
             continue
         latest[vid] = {
             "video_id": vid,
-            "captured_at": str(r.get("captured_at") or ""),
+            "captured_at": safe_str(r.get("captured_at")),
             "view_count": int(r["view_count"]),
             "like_count": int(r["like_count"]),
             "comment_count": int(r["comment_count"]),
         }
-    return pd.DataFrame(list(latest.values()))
+
+    out = pd.DataFrame(list(latest.values()))
+    if out.empty:
+        out = pd.DataFrame(columns=["video_id", "captured_at", "view_count", "like_count", "comment_count"])
+    return out
 
 
-# =========================
-# Mutations
-# =========================
-def add_channel(channel_input: str) -> Tuple[bool, str]:
-    cid = extract_channel_id(channel_input)
-    if not cid:
-        return False, "Nhập channel_id UC... hoặc URL dạng /channel/UC... (frontend không resolve @handle)."
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_latest_scan_time() -> Optional[str]:
+    """
+    Approx "robot scan time" (since frontend doesn't scan):
+    - Prefer max(snapshots.captured_at)
+    - Else prefer max(videos.updated_at)
+    - Else None
+    """
+    client = supa()
+
+    # snapshots max captured_at
+    try:
+        r = client.table("snapshots").select("captured_at").order("captured_at", desc=True).limit(1).execute()
+        row = (r.data or [None])[0]
+        if row and row.get("captured_at"):
+            return str(row["captured_at"])
+    except Exception:
+        pass
+
+    # videos max updated_at
+    try:
+        r = client.table("videos").select("updated_at").order("updated_at", desc=True).limit(1).execute()
+        row = (r.data or [None])[0]
+        if row and row.get("updated_at"):
+            return str(row["updated_at"])
+    except Exception:
+        pass
+
+    return None
+
+
+# -------------------------
+# Mutations (Add/Delete)
+# -------------------------
+def add_channel_row(user_input: str) -> Tuple[bool, str]:
+    """
+    Supports UC... OR @handle.
+    If you add only handle, scraper must be updated to resolve handle -> channel_id.
+    """
+    info = extract_channel_input(user_input)
+    cid = info["channel_id"]
+    handle = info["handle"]
+
+    if not cid and not handle:
+        return False, "Nhập UC... hoặc URL /channel/UC... hoặc @handle (vd: @MrBeast)."
+
+    payload: Dict[str, Any] = {}
+    if cid:
+        payload["channel_id"] = cid
+    if handle:
+        payload["handle"] = handle
 
     client = supa()
+
     try:
-        client.table("channels").upsert({"channel_id": cid}, on_conflict="channel_id").execute()
+        # best-effort:
+        # - if channel_id provided -> upsert on channel_id (requires unique constraint; if not, fallback to insert)
+        if cid:
+            try:
+                client.table("channels").upsert(payload, on_conflict="channel_id").execute()
+            except Exception:
+                client.table("channels").insert(payload).execute()
+        else:
+            # handle-only
+            client.table("channels").insert(payload).execute()
+
         fetch_channels.clear()
-        fetch_latest_videos.clear()
-        fetch_latest_snapshots_for_videos.clear()
-        return True, f"✅ Đã thêm kênh: {cid}. Scraper sẽ cập nhật title/handle/subscribers ở lần chạy tới."
+        fetch_videos.clear()
+        fetch_latest_video_snapshots.clear()
+        fetch_latest_scan_time.clear()
+
+        if cid and not handle:
+            return True, f"✅ Đã thêm kênh: {cid}. Robot sẽ tự cập nhật title/subscribers ở lần quét tới."
+        if handle and not cid:
+            return True, f"✅ Đã thêm handle: {handle}. (Cần scraper hỗ trợ resolve handle → channel_id để kéo video.)"
+        return True, f"✅ Đã thêm: {cid or ''} {handle or ''}".strip()
+
     except Exception as e:
-        return False, f"❌ Lỗi thêm kênh: {e}"
+        return False, f"❌ Thêm kênh thất bại: {e}"
 
 
-def delete_channel(channel_id: str, delete_children: bool) -> Tuple[bool, str]:
+def delete_channel_row(channel_id: str, delete_children: bool = True) -> Tuple[bool, str]:
     client = supa()
     try:
         if delete_children:
-            # delete snapshots by video_ids
+            # delete snapshots by video_ids -> delete videos
             vids: List[str] = []
             try:
                 vres = client.table("videos").select("video_id").eq("channel_id", channel_id).limit(5000).execute()
@@ -340,139 +463,158 @@ def delete_channel(channel_id: str, delete_children: bool) -> Tuple[bool, str]:
         client.table("channels").delete().eq("channel_id", channel_id).execute()
 
         fetch_channels.clear()
-        fetch_latest_videos.clear()
-        fetch_latest_snapshots_for_videos.clear()
+        fetch_videos.clear()
+        fetch_latest_video_snapshots.clear()
+        fetch_latest_scan_time.clear()
         return True, f"✅ Đã xoá kênh: {channel_id}"
+
     except Exception as e:
-        return False, f"❌ Lỗi xoá kênh: {e}"
+        return False, f"❌ Xoá kênh thất bại: {e}"
 
 
-# =========================
-# UI / CSS with Hamburger
-# =========================
-def inject_css(sidebar_collapsed: bool):
-    # sidebar never disappears; it collapses to narrow strip
+# -------------------------
+# RPM Auto Predictor (heuristic)
+# -------------------------
+def auto_rpm_estimate(videos_df: pd.DataFrame) -> Dict[str, float]:
+    """
+    Heuristic (not real):
+    - language: vi/en/mixed
+    - shorts share
+    - engagement (likes+comments)/views
+    Output: suggested rpm_long, rpm_shorts
+    """
+    if videos_df.empty:
+        return {"rpm_long": 1.5, "rpm_shorts": 0.2}
+
+    # safe columns
+    for c in ["duration_sec", "view_count", "like_count", "comment_count", "title"]:
+        if c not in videos_df.columns:
+            videos_df[c] = 0 if c != "title" else ""
+
+    v = videos_df.copy()
+    v = coerce_int(v, ["duration_sec", "view_count", "like_count", "comment_count"])
+
+    # language guess
+    titles = [safe_str(x) for x in v["title"].tolist()[:200]]
+    lang = guess_lang_from_titles(titles)
+
+    # shorts share
+    shorts_share = float((v["duration_sec"] <= 60).mean()) if len(v) > 0 else 0.0
+
+    # engagement
+    views_sum = int(v["view_count"].sum())
+    likes_sum = int(v["like_count"].sum())
+    comm_sum = int(v["comment_count"].sum())
+    eng = (likes_sum + comm_sum) / max(1, views_sum)  # 0..1
+
+    # base by language
+    # (pure heuristic)
+    if lang == "en":
+        base_long = 3.5
+    elif lang == "vi":
+        base_long = 1.8
+    else:
+        base_long = 2.4
+
+    # engagement boosts a bit
+    base_long += min(2.0, max(0.0, (eng - 0.01) * 80))  # eng 1% ~ +0, eng 3% ~ +1.6
+
+    # shorts reduces long RPM slightly if channel is shorts-heavy
+    base_long *= (1.0 - min(0.35, shorts_share * 0.35))
+
+    # shorts RPM baseline depends on language + engagement
+    base_shorts = 0.15 if lang == "vi" else (0.35 if lang == "en" else 0.25)
+    base_shorts += min(0.6, max(0.0, (eng - 0.008) * 60))
+
+    # clamp
+    rpm_long = float(max(0.3, min(12.0, base_long)))
+    rpm_shorts = float(max(0.03, min(2.0, base_shorts)))
+
+    return {"rpm_long": rpm_long, "rpm_shorts": rpm_shorts}
+
+
+# -------------------------
+# UI / CSS
+# -------------------------
+def inject_css():
     st.markdown(
-        f"""
+        """
         <style>
-          header[data-testid="stHeader"]{{ background: transparent !important; }}
-          div[data-testid="stToolbar"]{{ display:none !important; }}
-          #MainMenu{{ visibility:hidden; }}
-          footer{{ visibility:hidden; }}
+          header[data-testid="stHeader"]{ background: transparent !important; }
+          div[data-testid="stToolbar"]{ display:none !important; }
+          #MainMenu{ visibility:hidden; }
+          footer{ visibility:hidden; }
 
           @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap');
-          html, body, [class*="css"]{{
+          html, body, [class*="css"]{
             font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif !important;
-          }}
-          .stApp{{
+          }
+          .stApp{
             background: linear-gradient(180deg, #0b0b0b 0%, #0a0a0a 100%);
             color: rgba(230,232,238,0.92);
-          }}
-          .block-container{{
+          }
+          .block-container{
             max-width: 1500px;
             padding-top: 0.8rem;
             padding-bottom: 2rem;
-          }}
+          }
 
-          /* ALWAYS-clickable hamburger */
-          .tw-fab{{
-            position: fixed;
-            top: 12px;
-            left: 12px;
-            width: 44px;
-            height: 44px;
-            border-radius: 12px;
-            z-index: 999999;
-            background: rgba(255,255,255,0.04);
-            border: 1px solid rgba(255,255,255,0.16);
-            color: rgba(230,232,238,0.92) !important;
-            font-size: 20px;
-            font-weight: 900;
-            display:flex;
-            align-items:center;
-            justify-content:center;
-            cursor: pointer;
-            text-decoration:none !important;
-          }}
-          .tw-fab:hover{{
-            background: rgba(255,255,255,0.06);
-            border-color: rgba(255,255,255,0.22);
-          }}
-
-          /* Force sidebar visible (prevent Streamlit slide-out) */
-          section[data-testid="stSidebar"]{{
-            transform: none !important;
-            margin-left: 0 !important;
-            background: #0f0f0f;
-            border-right: 1px solid rgba(255,255,255,0.08);
-            transition: width 180ms ease;
-            width: {76 if sidebar_collapsed else 280}px !important;
-          }}
-          section[data-testid="stSidebar"] *{{ color: rgba(230,232,238,0.92) !important; }}
-
-          /* Hide sidebar content when collapsed */
-          {"" if not sidebar_collapsed else """
-          section[data-testid="stSidebar"] .stSidebarContent{ opacity: 0; pointer-events: none; }
-          """}
-
-          /* Top bar */
-          .tw-top{{
+          .tw-top{
             display:flex; align-items:center; justify-content:space-between;
             padding: 10px 12px; border-radius: 16px;
             border: 1px solid rgba(255,255,255,0.10);
             background: rgba(255,255,255,0.02);
             margin-bottom: 14px;
-          }}
-          .tw-brand{{ font-weight: 900; font-size: 18px; }}
-          .tw-pill{{
+          }
+          .tw-brand{ font-weight: 900; font-size: 18px; }
+          .tw-pill{
             padding: 6px 10px; border-radius: 999px;
             border: 1px solid rgba(255,255,255,0.12);
             background: rgba(255,255,255,0.03);
             font-weight: 800; font-size: 12px;
-          }}
+          }
 
-          /* Video cards */
-          .tw-grid{{
+          .tw-grid{
             display:grid;
             grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
             gap: 16px;
-          }}
-          .tw-card{{ border-radius: 16px; }}
-          .tw-thumb{{
+          }
+          .tw-card{ border-radius: 16px; }
+          .tw-thumb{
             position:relative; width:100%; aspect-ratio:16/9;
             border-radius: 16px; overflow:hidden;
             border:1px solid rgba(255,255,255,0.10);
             background: rgba(255,255,255,0.04);
-          }}
-          .tw-thumb img{{ width:100%; height:100%; object-fit:cover; display:block; }}
-          .tw-badge{{
+          }
+          .tw-thumb img{ width:100%; height:100%; object-fit:cover; display:block; }
+          .tw-badge{
             position:absolute; left:10px; top:10px;
             padding: 3px 8px; border-radius: 999px;
             font-weight: 900; font-size: 12px;
             border: 1px solid rgba(34,197,94,0.45);
             background: rgba(34,197,94,0.12);
             color: #86efac;
-          }}
-          .tw-meta{{ padding: 8px 2px 0 2px; }}
-          .tw-title{{
+          }
+          .tw-meta{ padding: 8px 2px 0 2px; }
+          .tw-title{
             font-weight: 900; font-size: 14px; line-height: 1.25;
             display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
             overflow:hidden; min-height: 36px;
-          }}
-          .tw-sub{{
+          }
+          .tw-sub{
             margin-top: 6px;
             color: rgba(230,232,238,0.65);
             font-size: 12px;
             white-space: nowrap; overflow:hidden; text-overflow:ellipsis;
-          }}
-          .tw-metrics{{
+          }
+          .tw-metrics{
             margin-top: 6px;
             color: rgba(230,232,238,0.78);
             font-size: 12px;
             display:flex; gap:10px; flex-wrap:wrap;
-          }}
-          .tw-metrics b{{ color: rgba(230,232,238,0.92); }}
-          .tw-open{{ text-decoration:none; color: inherit; }}
+          }
+          .tw-metrics b{ color: rgba(230,232,238,0.92); }
+          .tw-open{ text-decoration:none; color: inherit; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -484,30 +626,30 @@ def render_video_grid(videos: pd.DataFrame, channels: pd.DataFrame, rpm_long: fl
         st.info("Chưa có video trong bảng videos.")
         return
 
+    # channel map
     ch_map: Dict[str, Dict[str, Any]] = {}
     if not channels.empty:
         for _, r in channels.iterrows():
-            cid = str(r["channel_id"])
-            ch_map[cid] = {
-                "title": (str(r["title"]).strip() or str(r["handle"]).strip() or cid),
-                "subs": int(r["subscribers"]),
-            }
+            cid = safe_str(r["channel_id"])
+            name = safe_str(r["title"]).strip() or safe_str(r["handle"]).strip() or cid
+            ch_map[cid] = {"name": name, "subs": int(r["subscribers"])}
 
     parts = ["<div class='tw-grid'>"]
     for _, r in videos.iterrows():
-        vid = str(r["video_id"])
-        cid = str(r["channel_id"])
-        title = str(r["title"])
-        url = str(r["url"])
-        thumb = str(r["thumb_url"])
-        published_at = str(r["published_at"] or r["created_at"])
+        vid = safe_str(r["video_id"])
+        cid = safe_str(r["channel_id"])
+        title = safe_str(r["title"])
+        url = safe_str(r["url"])
+        thumb = safe_str(r["thumb_url"])
+
+        published_at = safe_str(r["published_at"]) or safe_str(r["created_at"]) or safe_str(r["updated_at"])
         ago = time_ago_vi(published_at)
 
         views = int(r["view_count"])
         likes = int(r["like_count"])
         comments = int(r["comment_count"])
 
-        ch_title = ch_map.get(cid, {}).get("title", cid)
+        ch_name = ch_map.get(cid, {}).get("name", cid)
         subs = int(ch_map.get(cid, {}).get("subs", 0))
         rel = (views / max(1, subs)) if subs > 0 else 0.0
         viral = rel >= float(viral_rel_threshold)
@@ -527,7 +669,7 @@ def render_video_grid(videos: pd.DataFrame, channels: pd.DataFrame, rpm_long: fl
                 </div>
                 <div class="tw-meta">
                   <div class="tw-title">{title}</div>
-                  <div class="tw-sub">{ch_title} • {fmt_num(views)} lượt xem • {ago}</div>
+                  <div class="tw-sub">{ch_name} • {fmt_num(views)} lượt xem • {ago}</div>
                   <div class="tw-metrics">
                     <span>👁️ <b>{views:,}</b></span>
                     <span>👍 <b>{likes:,}</b></span>
@@ -539,26 +681,23 @@ def render_video_grid(videos: pd.DataFrame, channels: pd.DataFrame, rpm_long: fl
             </div>
             """
         )
+
     parts.append("</div>")
     st.markdown("\n".join(parts), unsafe_allow_html=True)
 
 
-# =========================
+# -------------------------
 # Main
-# =========================
+# -------------------------
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide", initial_sidebar_state="expanded")
+    inject_css()
 
-    qp = get_query_params()
-    sb = (qp.get("sb", ["0"])[0] or "0")
-    sidebar_collapsed = (sb == "1")
+    if not secrets_ok():
+        st.error("Thiếu secrets: SUPABASE_URL và SUPABASE_SERVICE_ROLE_KEY trong Streamlit Cloud.")
+        st.stop()
 
-    # Hamburger always visible
-    target = "0" if sidebar_collapsed else "1"
-    st.markdown(f"<a class='tw-fab' href='?sb={target}'>☰</a>", unsafe_allow_html=True)
-
-    inject_css(sidebar_collapsed=sidebar_collapsed)
-
+    # Top bar
     st.markdown(
         """
         <div class="tw-top">
@@ -572,101 +711,140 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # Sidebar controls (ẩn khi collapsed)
+    # Sidebar (NO hide/collapse)
     st.sidebar.header("⚙️ Điều khiển")
 
     if st.sidebar.button("🔄 Refresh dữ liệu", use_container_width=True):
         fetch_channels.clear()
-        fetch_latest_videos.clear()
-        fetch_latest_snapshots_for_videos.clear()
+        fetch_videos.clear()
+        fetch_latest_video_snapshots.clear()
+        fetch_latest_scan_time.clear()
         st.rerun()
 
-    st.sidebar.subheader("➕ Thêm kênh")
-    ch_in = st.sidebar.text_input("Channel ID / URL", placeholder="UCxxxx… hoặc https://youtube.com/channel/UCxxxx")
-    if st.sidebar.button("Thêm", use_container_width=True):
-        ok, msg = add_channel(ch_in)
-        (st.sidebar.success if ok else st.sidebar.error)(msg)
+    # Scan status (approx)
+    st.sidebar.subheader("🛰️ Trạng thái robot")
+    last_scan = fetch_latest_scan_time()
+    if last_scan:
+        st.sidebar.caption(f"Lần cập nhật gần nhất: **{time_ago_vi(last_scan)}**")
+        dt = parse_dt_any(last_scan)
+        if dt:
+            # 4h cycle progress: 0% right after scan, 100% at 4h
+            elapsed = max(0.0, (utc_now() - dt).total_seconds())
+            cycle = 4 * 3600.0
+            pct = min(1.0, elapsed / cycle)
+            st.sidebar.progress(pct, text=f"Chu kỳ 4 giờ: {int(pct*100)}%")
+    else:
+        st.sidebar.caption("Chưa thấy dữ liệu scan (snapshots/videos rỗng).")
 
     st.sidebar.divider()
-    st.sidebar.subheader("🗑️ Xoá kênh")
-    ch_df = fetch_channels()
 
+    # Add channel
+    st.sidebar.subheader("➕ Thêm kênh")
+    ch_in = st.sidebar.text_input("Nhập UC... hoặc @handle", placeholder="UCxxxx… hoặc @MrBeast")
+    if st.sidebar.button("Thêm kênh", use_container_width=True):
+        ok, msg = add_channel_row(ch_in)
+        (st.sidebar.success if ok else st.sidebar.error)(msg)
+
+    # Delete channel
+    st.sidebar.divider()
+    st.sidebar.subheader("🗑️ Xoá kênh")
+
+    ch_df = fetch_channels()
     picked: Optional[str] = None
     if ch_df.empty:
         st.sidebar.info("Chưa có kênh.")
     else:
         options = []
         for _, r in ch_df.iterrows():
-            label = (str(r["title"]).strip() or str(r["handle"]).strip() or str(r["channel_id"]))
+            label = safe_str(r["title"]).strip() or safe_str(r["handle"]).strip() or safe_str(r["channel_id"])
             options.append(f"{label}  •  {r['channel_id']}")
         pick = st.sidebar.selectbox("Chọn kênh", options=options)
         picked = pick.split("•")[-1].strip()
 
     delete_children = st.sidebar.toggle("Xoá kèm videos/snapshots", value=True)
-    if picked and st.sidebar.button("Xoá", use_container_width=True, type="primary"):
-        ok, msg = delete_channel(picked, delete_children=delete_children)
+    if picked and st.sidebar.button("Xoá kênh", use_container_width=True, type="primary"):
+        ok, msg = delete_channel_row(picked, delete_children=delete_children)
         (st.sidebar.success if ok else st.sidebar.error)(msg)
 
+    # RPM section
     st.sidebar.divider()
-    st.sidebar.subheader("💵 RPM (ước tính)")
-    rpm_long = st.sidebar.slider("RPM Long-form ($/1000 views)", 0.1, 30.0, 1.5, 0.1)
-    rpm_shorts = st.sidebar.slider("RPM Shorts ($/1000 views)", 0.01, 5.0, 0.2, 0.01)
-    viral_rel_threshold = st.sidebar.slider("Ngưỡng viral (Views/Subs ≥)", 1.0, 20.0, 3.0, 0.5)
+    st.sidebar.subheader("💵 RPM")
+    st.sidebar.caption("RPM auto là ước tính (không phải số thật).")
 
-    # Tabs
-    tab1, tab2, tab3 = st.tabs(["📺 Tổng quan Video", "🚀 Outlier Finder", "👥 Kênh Đối thủ"])
-
+    # Load data for auto RPM (safe even if empty)
     video_limit = int(st.secrets.get("DEFAULT_VIDEO_LIMIT", 120))
-    videos_df = fetch_latest_videos(limit=video_limit)
+    videos_df = fetch_videos(limit=video_limit)
 
-    # Ensure videos df and canonical metric columns (DB trống vẫn chạy)
+    # Normalize videos df for UI
     if videos_df.empty:
-        videos_df = pd.DataFrame(
-            columns=["video_id", "channel_id", "title", "published_at", "created_at", "thumb_url", "duration_sec", "url"]
-        )
-    videos_df = ensure_columns(
+        videos_df = pd.DataFrame(columns=["video_id", "channel_id", "title", "thumb_url", "url", "duration_sec", "published_at", "created_at", "updated_at"])
+    videos_df = ensure_df_columns(
         videos_df,
         {
             "video_id": "",
             "channel_id": "",
             "title": "",
+            "thumb_url": "",
+            "url": "",
+            "duration_sec": 0,
             "published_at": "",
             "created_at": "",
-            "thumb_url": "",
-            "duration_sec": 0,
-            "url": "",
+            "updated_at": "",
         },
     )
+    videos_df = coerce_int(videos_df, ["duration_sec"])
 
-    # default canonical metrics
+    # Merge snapshots -> canonical metric columns
     videos_df["view_count"] = 0
     videos_df["like_count"] = 0
     videos_df["comment_count"] = 0
 
     vid_ids = [str(x) for x in videos_df["video_id"].astype(str).tolist() if str(x).strip()]
-    snap_df = fetch_latest_snapshots_for_videos(vid_ids) if vid_ids else pd.DataFrame()
+    snap_df = fetch_latest_video_snapshots(vid_ids) if vid_ids else pd.DataFrame()
 
     if not snap_df.empty:
-        snap_df = ensure_columns(snap_df, {"video_id": "", "view_count": 0, "like_count": 0, "comment_count": 0})
-        snap_df = coerce_int_cols(snap_df, ["view_count", "like_count", "comment_count"])
+        snap_df = ensure_df_columns(snap_df, {"video_id": "", "view_count": 0, "like_count": 0, "comment_count": 0})
+        snap_df = coerce_int(snap_df, ["view_count", "like_count", "comment_count"])
+
         videos_df["video_id"] = videos_df["video_id"].astype(str)
         snap_df["video_id"] = snap_df["video_id"].astype(str)
-
         merged = videos_df.merge(
             snap_df[["video_id", "view_count", "like_count", "comment_count"]],
             on="video_id",
             how="left",
             suffixes=("", "_snap"),
         )
-
-        # prefer snapshot values when present
-        for col in ["view_count", "like_count", "comment_count"]:
-            if col in merged.columns:
-                merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0).astype(int)
-
+        # ensure ints
+        for c in ["view_count", "like_count", "comment_count"]:
+            merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0).astype(int)
         videos_df = merged
 
-    videos_df = coerce_int_cols(videos_df, ["duration_sec", "view_count", "like_count", "comment_count"])
+    videos_df = coerce_int(videos_df, ["view_count", "like_count", "comment_count", "duration_sec"])
+
+    # Auto RPM
+    auto = st.sidebar.toggle("Tự động dự đoán RPM", value=True)
+    auto_suggest = auto_rpm_estimate(videos_df)
+
+    if "rpm_long" not in st.session_state:
+        st.session_state["rpm_long"] = float(auto_suggest["rpm_long"])
+    if "rpm_shorts" not in st.session_state:
+        st.session_state["rpm_shorts"] = float(auto_suggest["rpm_shorts"])
+
+    if auto:
+        # keep updating suggestions but not overriding user unless they click apply
+        st.sidebar.info(f"Gợi ý: Long ≈ ${auto_suggest['rpm_long']:.2f} | Shorts ≈ ${auto_suggest['rpm_shorts']:.2f}")
+
+        if st.sidebar.button("Áp dụng gợi ý RPM", use_container_width=True):
+            st.session_state["rpm_long"] = float(auto_suggest["rpm_long"])
+            st.session_state["rpm_shorts"] = float(auto_suggest["rpm_shorts"])
+            st.rerun()
+
+    rpm_long = st.sidebar.slider("RPM Long-form ($/1000 views)", 0.1, 30.0, float(st.session_state["rpm_long"]), 0.1, key="rpm_long")
+    rpm_shorts = st.sidebar.slider("RPM Shorts ($/1000 views)", 0.01, 5.0, float(st.session_state["rpm_shorts"]), 0.01, key="rpm_shorts")
+    viral_rel_threshold = st.sidebar.slider("Ngưỡng viral (Views/Subs ≥)", 1.0, 20.0, 3.0, 0.5)
+
+    # Tabs
+    tab1, tab2, tab3 = st.tabs(["📺 Tổng quan Video", "🚀 Outlier Finder", "👥 Kênh Đối thủ"])
 
     # TAB 1
     with tab1:
@@ -676,6 +854,7 @@ def main():
         c3.metric("Tổng subscribers", fmt_num(int(ch_df["subscribers"].sum()) if not ch_df.empty else 0))
 
         st.divider()
+
         f1, f2, f3 = st.columns([0.45, 0.25, 0.30])
         q = f1.text_input("Tìm theo tiêu đề", value="", placeholder="Search…")
         sort_mode = f2.selectbox("Sắp xếp", ["Mới nhất", "Nhiều view"], index=0)
@@ -688,25 +867,19 @@ def main():
         if sort_mode == "Nhiều view":
             df_show = df_show.sort_values("view_count", ascending=False)
         else:
-            sort_col = "published_at" if "published_at" in df_show.columns else "created_at"
+            # sort by published_at/created_at/updated_at
+            sort_col = "published_at"
+            if sort_col not in df_show.columns:
+                sort_col = "created_at" if "created_at" in df_show.columns else "updated_at"
             df_show["_dt"] = pd.to_datetime(df_show[sort_col].astype(str).str.replace("Z", "+00:00"), utc=True, errors="coerce")
             df_show = df_show.sort_values("_dt", ascending=False).drop(columns=["_dt"], errors="ignore")
 
         df_show = df_show.head(int(show_n))
         render_video_grid(df_show, ch_df, rpm_long=rpm_long, rpm_shorts=rpm_shorts, viral_rel_threshold=viral_rel_threshold)
 
-        st.divider()
-        st.download_button(
-            "⬇️ Tải CSV (videos hiển thị)",
-            data=df_show.to_csv(index=False).encode("utf-8"),
-            file_name="videos_overview.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
     # TAB 2
     with tab2:
-        st.caption("Lọc video trong 7 ngày qua có **Views ≥ 3× Subscribers**.")
+        st.caption("Lọc video trong N ngày qua có **Views ≥ 3× Subscribers** (views lấy từ snapshots mới nhất).")
         days = st.slider("Khoảng ngày", 1, 30, 7)
         ratio = st.slider("Ngưỡng Views/Subs", 1.0, 20.0, 3.0, 0.5)
 
@@ -714,14 +887,15 @@ def main():
             st.info("Chưa đủ dữ liệu (cần channels + videos + snapshots).")
         else:
             df_out = videos_df.copy()
-            sort_col = "published_at" if "published_at" in df_out.columns else "created_at"
-            df_out["_p"] = pd.to_datetime(df_out[sort_col].astype(str).str.replace("Z", "+00:00"), utc=True, errors="coerce")
+            # choose time field
+            tcol = "published_at" if "published_at" in df_out.columns else ("created_at" if "created_at" in df_out.columns else "updated_at")
+            df_out["_p"] = pd.to_datetime(df_out[tcol].astype(str).str.replace("Z", "+00:00"), utc=True, errors="coerce")
             df_out = df_out.dropna(subset=["_p"])
-            df_out = df_out[df_out["_p"] >= (datetime.now(timezone.utc) - timedelta(days=int(days)))].copy()
+            df_out = df_out[df_out["_p"] >= (utc_now() - timedelta(days=int(days)))].copy()
 
-            subs_map = {str(r["channel_id"]): int(r["subscribers"]) for _, r in ch_df.iterrows()}
+            subs_map = {safe_str(r["channel_id"]): int(r["subscribers"]) for _, r in ch_df.iterrows()}
             name_map = {
-                str(r["channel_id"]): (str(r["title"]).strip() or str(r["handle"]).strip() or str(r["channel_id"]))
+                safe_str(r["channel_id"]): (safe_str(r["title"]).strip() or safe_str(r["handle"]).strip() or safe_str(r["channel_id"]))
                 for _, r in ch_df.iterrows()
             }
 
@@ -754,6 +928,7 @@ def main():
             show["Tên hiển thị"] = show["title"].astype(str).str.strip()
             show.loc[show["Tên hiển thị"].eq(""), "Tên hiển thị"] = show["handle"].astype(str).str.strip()
             show.loc[show["Tên hiển thị"].eq(""), "Tên hiển thị"] = show["channel_id"].astype(str)
+
             st.dataframe(
                 show[["Tên hiển thị", "handle", "channel_id", "subscribers", "created_at"]].rename(
                     columns={
