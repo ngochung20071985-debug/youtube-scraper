@@ -1,6 +1,0 @@
-streamlit>=1.28
-pandas>=2.0
-aiohttp>=3.9
-altair>=5.0
-pillow>=10.0
-requests>=2.31
