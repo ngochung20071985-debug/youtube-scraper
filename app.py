@@ -1,13 +1,16 @@
 # app.py
 # -*- coding: utf-8 -*-
-"""
-toolwatch (Streamlit Frontend-only) — Supabase
+"""toolwatch (Streamlit Frontend-only) — Supabase
 
-Mục tiêu: UI dark + bố cục "giống NexLev" trong giới hạn Streamlit.
-✅ Không sqlite3
-✅ Không gọi YouTube API (chỉ SELECT/INSERT/DELETE Supabase)
-✅ Sidebar luôn hiện, ẩn nút << (collapse)
-✅ DB trống vẫn chạy
+Mục tiêu:
+- UI dark + bố cục giống NexLev trong giới hạn Streamlit
+- Frontend only: KHÔNG gọi YouTube API
+- Supabase via st.secrets
+- DB trống vẫn chạy
+
+Ghi chú quan trọng:
+- Geo/Age/Gender (Audience) là ƯỚC TÍNH, không phải số thật (vì không dùng YouTube Analytics API OAuth).
+- Muốn “gần đúng” hơn => scraper nên chạy thường xuyên và lưu thêm channel-level stats (khuyến nghị).
 """
 
 from __future__ import annotations
@@ -25,10 +28,9 @@ APP_TITLE = "toolwatch • NexLev-style (Supabase)"
 YOUTUBE_WATCH = "https://www.youtube.com/watch?v="
 YOUTUBE_THUMB = "https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
 
+SCAN_INTERVAL_SECONDS = 3600  # 1 giờ
 
-# -------------------------
-# Helpers
-# -------------------------
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -162,7 +164,7 @@ def clamp(x: float, lo: float, hi: float) -> float:
 
 
 def auto_rpm_estimate(videos_df: pd.DataFrame) -> Dict[str, float]:
-    """Ước tính RPM dựa trên language + engagement (heuristic)."""
+    """Ước tính RPM dựa trên language + engagement (heuristic, conservative)."""
     if videos_df.empty:
         return {"rpm_long": 1.5, "rpm_shorts": 0.2}
 
@@ -178,29 +180,32 @@ def auto_rpm_estimate(videos_df: pd.DataFrame) -> Dict[str, float]:
     comm_sum = int(v["comment_count"].sum())
     eng = (likes_sum + comm_sum) / max(1, views_sum)  # ratio
 
-    base_long = 3.5 if lang == "en" else (1.8 if lang == "vi" else 2.4)
-    base_long += clamp((eng - 0.01) * 80, 0.0, 2.0)
+    base_long = 3.2 if lang == "en" else (1.6 if lang == "vi" else 2.2)
+    base_long += clamp((eng - 0.01) * 60, 0.0, 1.6)
 
-    base_shorts = (0.15 if lang == "vi" else (0.35 if lang == "en" else 0.25))
-    base_shorts += clamp((eng - 0.008) * 60, 0.0, 0.6)
+    base_shorts = (0.12 if lang == "vi" else (0.30 if lang == "en" else 0.22))
+    base_shorts += clamp((eng - 0.008) * 45, 0.0, 0.45)
 
-    return {"rpm_long": clamp(base_long, 0.3, 12.0), "rpm_shorts": clamp(base_shorts, 0.03, 2.0)}
+    return {"rpm_long": clamp(base_long, 0.3, 10.0), "rpm_shorts": clamp(base_shorts, 0.03, 1.5)}
 
 
-def audience_estimator(lang: str, niche: str = "") -> Dict[str, Any]:
-    """
-    Ước tính audience (NOT real).
-    Output: geos list, gender dict, ages list.
-    """
+def audience_estimator(lang: str, niche: str = "", market_hint: str = "Auto") -> Dict[str, Any]:
+    """Ước tính audience (NOT real)."""
     niche = (niche or "").lower()
 
-    # Base by language
-    if lang == "vi":
-        geos = [("Vietnam", 58), ("United States", 12), ("Japan", 7), ("Korea", 6), ("Australia", 4), ("Canada", 3)]
-    elif lang == "en":
-        geos = [("United States", 42), ("India", 18), ("United Kingdom", 10), ("Canada", 7), ("Australia", 6), ("Germany", 4)]
+    if market_hint == "VN":
+        geos = [("Vietnam", 70), ("United States", 10), ("Japan", 6), ("Korea", 5), ("Australia", 3), ("Canada", 2)]
+    elif market_hint == "US/EN":
+        geos = [("United States", 50), ("India", 16), ("United Kingdom", 10), ("Canada", 7), ("Australia", 7), ("Germany", 4)]
+    elif market_hint == "Global":
+        geos = [("United States", 30), ("India", 18), ("Vietnam", 10), ("United Kingdom", 8), ("Canada", 6), ("Australia", 5)]
     else:
-        geos = [("United States", 28), ("India", 16), ("Vietnam", 10), ("United Kingdom", 8), ("Canada", 6), ("Australia", 5)]
+        if lang == "vi":
+            geos = [("Vietnam", 58), ("United States", 12), ("Japan", 7), ("Korea", 6), ("Australia", 4), ("Canada", 3)]
+        elif lang == "en":
+            geos = [("United States", 42), ("India", 18), ("United Kingdom", 10), ("Canada", 7), ("Australia", 6), ("Germany", 4)]
+        else:
+            geos = [("United States", 28), ("India", 16), ("Vietnam", 10), ("United Kingdom", 8), ("Canada", 6), ("Australia", 5)]
 
     male = 65
     female = 35
@@ -217,16 +222,9 @@ def audience_estimator(lang: str, niche: str = "") -> Dict[str, Any]:
     elif any(k in niche for k in ["kids", "children"]):
         ages = [("13-17", 15), ("18-24", 35), ("25-34", 30), ("35-44", 12), ("45-54", 5), ("55-64", 2), ("65+", 1)]
 
-    return {
-        "geos": geos,
-        "gender": {"Male": male, "Female": female, "User-specified": 0},
-        "ages": ages,
-    }
+    return {"geos": geos, "gender": {"Male": male, "Female": female, "User-specified": 0}, "ages": ages}
 
 
-# -------------------------
-# Supabase
-# -------------------------
 @st.cache_resource
 def supa() -> Client:
     url = st.secrets["SUPABASE_URL"]
@@ -234,31 +232,20 @@ def supa() -> Client:
     return create_client(url, key)
 
 
-# -------------------------
-# Data fetch
-# -------------------------
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_channels() -> pd.DataFrame:
     client = supa()
-    res = (
-        client.table("channels")
-        .select("id,channel_id,title,handle,avatar_url,subscribers,created_at")
-        .order("subscribers", desc=True)
-        .execute()
-    )
+    res = client.table("channels").select("id,channel_id,title,handle,avatar_url,subscribers,created_at").order("subscribers", desc=True).execute()
     df = pd.DataFrame(res.data or [])
     if df.empty:
         df = pd.DataFrame(columns=["id", "channel_id", "title", "handle", "avatar_url", "subscribers", "created_at"])
-    df = ensure_df_columns(
-        df,
-        {"id": None, "channel_id": "", "title": "", "handle": "", "avatar_url": "", "subscribers": 0, "created_at": ""},
-    )
+    df = ensure_df_columns(df, {"id": None, "channel_id": "", "title": "", "handle": "", "avatar_url": "", "subscribers": 0, "created_at": ""})
     df = coerce_int(df, ["subscribers"])
     return df
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_videos(limit: int = 300) -> pd.DataFrame:
+def fetch_videos(limit: int = 400) -> pd.DataFrame:
     client = supa()
     res = None
     for col in ("published_at", "video_id", None):
@@ -272,13 +259,8 @@ def fetch_videos(limit: int = 300) -> pd.DataFrame:
             res = None
     df = pd.DataFrame((res.data if res else []) or [])
     if df.empty:
-        df = pd.DataFrame(
-            columns=["video_id", "channel_id", "published_at", "title", "description", "tags_json", "niche", "sentiment"]
-        )
-    df = ensure_df_columns(
-        df,
-        {"video_id": "", "channel_id": "", "published_at": "", "title": "", "description": "", "tags_json": "", "niche": "", "sentiment": ""},
-    )
+        df = pd.DataFrame(columns=["video_id", "channel_id", "published_at", "title", "description", "tags_json", "niche", "sentiment"])
+    df = ensure_df_columns(df, {"video_id": "", "channel_id": "", "published_at": "", "title": "", "description": "", "tags_json": "", "niche": "", "sentiment": ""})
     return df
 
 
@@ -332,9 +314,19 @@ def fetch_latest_video_snapshots(video_ids: List[str]) -> pd.DataFrame:
     return out
 
 
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_scraper_state() -> Dict[str, Any]:
+    client = supa()
+    try:
+        r = client.table("scraper_state").select("*").order("updated_at", desc=True).limit(1).execute()
+        row = (r.data or [None])[0] or {}
+        return dict(row)
+    except Exception:
+        return {}
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_snapshots_since(video_ids: List[str], since_iso: str, hard_limit: int = 200000) -> pd.DataFrame:
-    """Fetch snapshots >= since for a set of video ids (cap rows)."""
     if not video_ids:
         return pd.DataFrame(columns=["video_id", "captured_at", "view_count", "like_count", "comment_count"])
 
@@ -357,7 +349,6 @@ def fetch_snapshots_since(video_ids: List[str], since_iso: str, hard_limit: int 
             rows.extend(r.data or [])
         except Exception:
             continue
-
         if len(rows) >= hard_limit:
             break
 
@@ -382,14 +373,10 @@ def fetch_latest_scan_time() -> Optional[str]:
     return None
 
 
-# -------------------------
-# Mutations
-# -------------------------
 def add_channel_row(user_input: str) -> Tuple[bool, str]:
     info = extract_channel_input(user_input)
     cid = info["channel_id"]
     handle = info["handle"]
-
     if not cid and not handle:
         return False, "Nhập UC... hoặc URL /channel/UC... hoặc @handle."
 
@@ -406,12 +393,8 @@ def add_channel_row(user_input: str) -> Tuple[bool, str]:
         else:
             client.table("channels").insert(payload).execute()
 
-        fetch_channels.clear()
-        fetch_videos.clear()
-        fetch_latest_video_snapshots.clear()
-        fetch_snapshots_since.clear()
-        fetch_latest_scan_time.clear()
-        return True, "✅ Đã thêm. Robot sẽ tự quét và đổ data vào videos/snapshots."
+        clear_caches()
+        return True, "✅ Đã thêm kênh. Robot sẽ tự quét trong lần chạy tiếp theo."
     except Exception as e:
         return False, f"❌ Thêm kênh thất bại: {e}"
 
@@ -420,7 +403,6 @@ def delete_channel_by_row(row: Dict[str, Any], delete_children: bool = True) -> 
     client = supa()
     row_id = row.get("id")
     channel_id = safe_str(row.get("channel_id")).strip()
-
     try:
         if delete_children and channel_id:
             vids = []
@@ -429,7 +411,6 @@ def delete_channel_by_row(row: Dict[str, Any], delete_children: bool = True) -> 
                 vids = [str(r["video_id"]) for r in (vres.data or []) if r.get("video_id")]
             except Exception:
                 vids = []
-
             if vids:
                 client.table("snapshots").delete().in_("video_id", vids).execute()
             client.table("videos").delete().eq("channel_id", channel_id).execute()
@@ -440,19 +421,21 @@ def delete_channel_by_row(row: Dict[str, Any], delete_children: bool = True) -> 
             if channel_id:
                 client.table("channels").delete().eq("channel_id", channel_id).execute()
 
-        fetch_channels.clear()
-        fetch_videos.clear()
-        fetch_latest_video_snapshots.clear()
-        fetch_snapshots_since.clear()
-        fetch_latest_scan_time.clear()
+        clear_caches()
         return True, "✅ Đã xoá kênh."
     except Exception as e:
         return False, f"❌ Xoá kênh thất bại: {e}"
 
 
-# -------------------------
-# CSS (NexLev-ish)
-# -------------------------
+def clear_caches():
+    fetch_channels.clear()
+    fetch_videos.clear()
+    fetch_latest_video_snapshots.clear()
+    fetch_scraper_state.clear()
+    fetch_snapshots_since.clear()
+    fetch_latest_scan_time.clear()
+
+
 def inject_css():
     st.markdown(
         """
@@ -462,7 +445,6 @@ def inject_css():
   #MainMenu{ visibility:hidden; }
   footer{ visibility:hidden; }
 
-  /* Sidebar: always expanded + remove collapse button */
   section[data-testid="stSidebar"]{
     transform:none !important;
     margin-left:0 !important;
@@ -503,44 +485,22 @@ def inject_css():
     font-weight: 800; font-size: 12px;
   }
 
-  /* Generic card */
-  .nx-card{
-    border-radius: 14px;
+  .nx-mini-wrap{ display:grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .nx-mini{
+    border-radius: 12px;
     border: 1px solid rgba(255,255,255,0.10);
     background: rgba(255,255,255,0.02);
-    padding: 12px 12px;
+    padding: 12px;
+    min-height: 76px;
   }
-  .nx-head{
-    display:flex; align-items:center; justify-content:space-between;
-    margin-bottom: 8px;
-  }
-  .nx-title{
-    font-weight: 900;
-    font-size: 14px;
-    display:flex; align-items:center; gap:8px;
-  }
-  .nx-reveal{
-    padding: 6px 10px;
-    border-radius: 10px;
-    border: 1px solid rgba(255,255,255,0.12);
-    background: rgba(255,255,255,0.03);
-    font-weight: 900;
-    font-size: 12px;
-    color: rgba(230,232,238,0.9);
-  }
-  .nx-big{
-    font-weight: 900;
-    font-size: 40px;
-    letter-spacing: -0.02em;
-    margin-top: 2px;
-  }
-  .nx-sub{
-    color: rgba(230,232,238,0.65);
-    font-size: 12px;
-    margin-top: 4px;
-  }
+  .nx-mini .k{ color: rgba(230,232,238,0.70); font-weight: 800; font-size: 12px; display:flex; gap:8px; align-items:center; }
+  .nx-mini .v{ margin-top: 6px; font-weight: 900; font-size: 18px; }
+  .nx-mini .s{ margin-top: 2px; color: rgba(230,232,238,0.55); font-size: 12px; }
 
-  /* Video card */
+  .nx-title{ font-weight: 900; font-size: 14px; display:flex; align-items:center; gap:8px; }
+  .nx-big{ font-weight: 900; font-size: 40px; letter-spacing: -0.02em; margin-top: 2px; }
+  .nx-sub{ color: rgba(230,232,238,0.65); font-size: 12px; margin-top: 4px; }
+
   .tw-card{ border-radius: 16px; border: 1px solid rgba(255,255,255,0.10); background: rgba(255,255,255,0.02); overflow:hidden; }
   .tw-thumb{ position:relative; width:100%; aspect-ratio:16/9; background: rgba(255,255,255,0.05); }
   .tw-thumb img{ width:100%; height:100%; object-fit:cover; object-position:center; display:block; }
@@ -552,108 +512,77 @@ def inject_css():
   .tw-chip{ padding: 3px 8px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.10); background: rgba(255,255,255,0.03); font-size: 12px; font-weight: 800; color: rgba(230,232,238,0.82); }
   .tw-chip b{ color: rgba(230,232,238,0.95); }
   a.tw-open{ text-decoration:none; color: inherit; display:block; }
-
-  /* Altair container */
-  .stAltairChart{ border-radius: 14px; overflow:hidden; }
 </style>
         """,
         unsafe_allow_html=True,
     )
 
 
-# -------------------------
-# NexLev-like insight block
-# -------------------------
-def card_start(title: str, icon: str, reveal_key: str, default_reveal: bool = True) -> bool:
-    """Render a header similar to NexLev and return reveal state."""
+def card_header(title: str, icon: str, reveal_key: str, default_reveal: bool = True) -> bool:
     if reveal_key not in st.session_state:
         st.session_state[reveal_key] = default_reveal
-    col_l, col_r = st.columns([0.78, 0.22])
-    with col_l:
+
+    left, right = st.columns([0.75, 0.25])
+    with left:
         st.markdown(f"<div class='nx-title'>{icon} {title}</div>", unsafe_allow_html=True)
-    with col_r:
-        btn = st.button("✨ Reveal", key=f"{reveal_key}_btn", use_container_width=True)
-        if btn:
+    with right:
+        if st.button("✨ Tiết lộ", key=f"{reveal_key}_btn", use_container_width=True):
             st.session_state[reveal_key] = not bool(st.session_state[reveal_key])
     return bool(st.session_state[reveal_key])
 
 
-def nx_metric_card(title: str, icon: str, value: str, sub: str, reveal_key: str, reveal_default: bool = True):
+def metric_card(title: str, icon: str, value: str, sub: str, reveal_key: str):
     with st.container(border=True):
-        reveal = card_start(title, icon, reveal_key, default_reveal=reveal_default)
+        reveal = card_header(title, icon, reveal_key, default_reveal=True)
         if reveal:
             st.markdown(f"<div class='nx-big'>{value}</div><div class='nx-sub'>{sub}</div>", unsafe_allow_html=True)
         else:
-            st.markdown("<div class='nx-big'>•••</div><div class='nx-sub'>Bấm Reveal</div>", unsafe_allow_html=True)
+            st.markdown("<div class='nx-big'>•••</div><div class='nx-sub'>Bấm Tiết lộ</div>", unsafe_allow_html=True)
 
 
-def nx_bar_list(title: str, icon: str, rows: List[Tuple[str, float]], reveal_key: str, note: str):
-    with st.container(border=True):
-        reveal = card_start(title, icon, reveal_key, default_reveal=True)
-        if not reveal:
-            st.markdown("<div class='nx-sub'>Bấm Reveal</div>", unsafe_allow_html=True)
-            return
-        if note:
-            st.caption(note)
-        if not rows:
-            st.info("Chưa có dữ liệu.")
-            return
-        df = pd.DataFrame(rows, columns=["name", "pct"])
-        # progress bars
-        for _, r in df.iterrows():
-            left, right = st.columns([0.75, 0.25])
-            with left:
-                st.write(r["name"])
-                st.progress(float(r["pct"]) / 100.0)
-            with right:
-                st.write(f"{float(r['pct']):.1f}%")
+def mini_cards_block(items: List[Tuple[str, str, str, str]]):
+    lines = ['<div class="nx-mini-wrap">']
+    for icon, key, val, sub in items:
+        lines.append('<div class="nx-mini">')
+        lines.append(f'<div class="k">{icon} {key}</div>')
+        lines.append(f'<div class="v">{val}</div>')
+        lines.append(f'<div class="s">{sub}</div>')
+        lines.append('</div>')
+    lines.append('</div>')
+    st.markdown("\n".join(lines), unsafe_allow_html=True)
 
 
-def compute_channel_window_metrics(
-    videos_df: pd.DataFrame,
-    channel_id: str,
-    rpm_long: float,
-    rpm_shorts: float,
-    window_days: int,
-    max_videos: int = 120,
-) -> Dict[str, Any]:
-    """Compute views/likes/comments deltas for last N days based on snapshots."""
-    ch_vids = videos_df[videos_df["channel_id"].astype(str) == str(channel_id)].copy()
-    if ch_vids.empty:
-        return {"views": 0, "likes": 0, "comments": 0, "rev": 0.0, "shorts_views": 0, "long_views": 0, "lang": "unknown", "niche": ""}
+def compute_window_deltas(videos_df: pd.DataFrame, channel_id: str, window_days: int, max_videos: int = 160) -> Dict[str, Any]:
+    ch = videos_df[videos_df["channel_id"].astype(str) == str(channel_id)].copy()
+    if ch.empty:
+        return {"views": 0, "likes": 0, "comments": 0, "shorts_views": 0, "long_views": 0, "lang": "unknown", "niche": ""}
 
-    # limit to most recent N videos to cap snapshot load
-    ch_vids["_dt"] = pd.to_datetime(ch_vids["published_at"].astype(str).str.replace("Z", "+00:00"), utc=True, errors="coerce")
-    ch_vids = ch_vids.sort_values("_dt", ascending=False).drop(columns=["_dt"], errors="ignore").head(int(max_videos))
+    ch["_dt"] = pd.to_datetime(ch["published_at"].astype(str).str.replace("Z", "+00:00"), utc=True, errors="coerce")
+    ch = ch.sort_values("_dt", ascending=False).drop(columns=["_dt"], errors="ignore").head(int(max_videos))
 
-    titles = [safe_str(x) for x in ch_vids["title"].tolist()[:200]]
+    titles = [safe_str(x) for x in ch["title"].tolist()[:200]]
     lang = guess_lang_from_titles(titles)
 
-    # pick a "dominant niche" if exists
     niche = ""
-    if "niche" in ch_vids.columns:
-        vc = ch_vids["niche"].astype(str).value_counts()
+    if "niche" in ch.columns:
+        vc = ch["niche"].astype(str).replace("None", "").replace("nan", "").value_counts()
         if len(vc) > 0:
             niche = vc.index[0]
 
-    since_dt = utc_now() - timedelta(days=int(window_days))
-    since_iso = since_dt.isoformat()
-    vid_ids = [str(x) for x in ch_vids["video_id"].astype(str).tolist() if str(x).strip()]
-    snap = fetch_snapshots_since(vid_ids, since_iso)
+    since = utc_now() - timedelta(days=int(window_days))
+    vid_ids = [str(x) for x in ch["video_id"].astype(str).tolist() if str(x).strip()]
+    snap = fetch_snapshots_since(vid_ids, since.isoformat(), hard_limit=220000)
 
     if snap.empty:
-        # fallback: use latest view_count already merged (still ok)
-        ch_vids = ensure_df_columns(ch_vids, {"view_count": 0, "like_count": 0, "comment_count": 0, "tags_json": ""})
-        ch_vids = coerce_int(ch_vids, ["view_count", "like_count", "comment_count"])
-        views = int(ch_vids["view_count"].sum())
-        likes = int(ch_vids["like_count"].sum())
-        comments = int(ch_vids["comment_count"].sum())
-        return {"views": views, "likes": likes, "comments": comments, "rev": (views/1000.0)*rpm_long, "shorts_views": 0, "long_views": views, "lang": lang, "niche": niche}
+        ch = ensure_df_columns(ch, {"view_count": 0, "like_count": 0, "comment_count": 0, "tags_json": ""})
+        ch = coerce_int(ch, ["view_count", "like_count", "comment_count"])
+        views = int(ch["view_count"].sum())
+        likes = int(ch["like_count"].sum())
+        comments = int(ch["comment_count"].sum())
+        return {"views": views, "likes": likes, "comments": comments, "shorts_views": 0, "long_views": views, "lang": lang, "niche": niche, "video_ids_used": len(vid_ids)}
 
     snap["captured_at_dt"] = pd.to_datetime(snap["captured_at"].astype(str).str.replace("Z", "+00:00"), utc=True, errors="coerce")
     snap = snap.dropna(subset=["captured_at_dt"]).sort_values(["video_id", "captured_at_dt"])
-
-    # delta per video: last - first within window
     first = snap.groupby("video_id").first(numeric_only=False)
     last = snap.groupby("video_id").last(numeric_only=False)
 
@@ -664,24 +593,20 @@ def compute_channel_window_metrics(
     delta = pd.DataFrame({"video_id": views_delta.index, "views": views_delta.values, "likes": likes_delta.values, "comments": comments_delta.values})
     delta["video_id"] = delta["video_id"].astype(str)
 
-    # attach shorts/long for rpm blend
-    ch_vids = ensure_df_columns(ch_vids, {"tags_json": "", "title": ""})
-    ch_vids["video_id"] = ch_vids["video_id"].astype(str)
-    merged = ch_vids[["video_id", "title", "tags_json"]].merge(delta, on="video_id", how="left")
+    ch = ensure_df_columns(ch, {"tags_json": "", "title": ""})
+    ch["video_id"] = ch["video_id"].astype(str)
+    merged = ch[["video_id", "title", "tags_json"]].merge(delta, on="video_id", how="left")
     merged = ensure_df_columns(merged, {"views": 0, "likes": 0, "comments": 0})
     merged = coerce_int(merged, ["views", "likes", "comments"])
-
     merged["is_shorts"] = merged.apply(lambda r: is_shorts_guess(str(r["title"]), str(r["tags_json"])), axis=1)
+
     shorts_views = int(merged.loc[merged["is_shorts"], "views"].sum())
     long_views = int(merged.loc[~merged["is_shorts"], "views"].sum())
-
-    rev = (long_views / 1000.0) * float(rpm_long) + (shorts_views / 1000.0) * float(rpm_shorts)
 
     return {
         "views": int(merged["views"].sum()),
         "likes": int(merged["likes"].sum()),
         "comments": int(merged["comments"].sum()),
-        "rev": float(rev),
         "shorts_views": shorts_views,
         "long_views": long_views,
         "lang": lang,
@@ -690,14 +615,7 @@ def compute_channel_window_metrics(
     }
 
 
-def build_views_timeseries(
-    videos_df: pd.DataFrame,
-    channel_id: str,
-    window: str,
-    max_videos: int = 80,
-) -> pd.DataFrame:
-    """Return df with columns: date, total_views (delta within day cumulative approximation)."""
-    # time range
+def build_views_timeseries(videos_df: pd.DataFrame, channel_id: str, window: str, max_videos: int = 80) -> pd.DataFrame:
     if window == "7D":
         since = utc_now() - timedelta(days=7)
     elif window == "14D":
@@ -709,15 +627,15 @@ def build_views_timeseries(
     else:
         since = utc_now() - timedelta(days=365)
 
-    ch_vids = videos_df[videos_df["channel_id"].astype(str) == str(channel_id)].copy()
-    if ch_vids.empty:
+    ch = videos_df[videos_df["channel_id"].astype(str) == str(channel_id)].copy()
+    if ch.empty:
         return pd.DataFrame(columns=["date", "views"])
 
-    ch_vids["_dt"] = pd.to_datetime(ch_vids["published_at"].astype(str).str.replace("Z", "+00:00"), utc=True, errors="coerce")
-    ch_vids = ch_vids.sort_values("_dt", ascending=False).drop(columns=["_dt"], errors="ignore").head(int(max_videos))
+    ch["_dt"] = pd.to_datetime(ch["published_at"].astype(str).str.replace("Z", "+00:00"), utc=True, errors="coerce")
+    ch = ch.sort_values("_dt", ascending=False).drop(columns=["_dt"], errors="ignore").head(int(max_videos))
 
-    vid_ids = [str(x) for x in ch_vids["video_id"].astype(str).tolist() if str(x).strip()]
-    snap = fetch_snapshots_since(vid_ids, since.isoformat(), hard_limit=200000)
+    vid_ids = [str(x) for x in ch["video_id"].astype(str).tolist() if str(x).strip()]
+    snap = fetch_snapshots_since(vid_ids, since.isoformat(), hard_limit=220000)
     if snap.empty:
         return pd.DataFrame(columns=["date", "views"])
 
@@ -725,164 +643,175 @@ def build_views_timeseries(
     snap = snap.dropna(subset=["captured_at_dt"])
     snap["date"] = snap["captured_at_dt"].dt.floor("D")
 
-    # For each video+date get last view_count, then sum across videos
     last_per_day = snap.sort_values("captured_at_dt").groupby(["video_id", "date"]).last(numeric_only=False).reset_index()
-    daily = last_per_day.groupby("date")["view_count"].sum().reset_index()
-    daily = daily.sort_values("date")
+    daily = last_per_day.groupby("date")["view_count"].sum().reset_index().sort_values("date")
 
-    # Convert to delta per day (growth)
     daily["views"] = daily["view_count"].diff().fillna(0).clip(lower=0).astype(int)
+
+    if window == "1Y":
+        daily["month"] = daily["date"].dt.to_period("M").dt.to_timestamp()
+        m = daily.groupby("month")["views"].sum().reset_index().rename(columns={"month": "date"})
+        return m[["date", "views"]]
     return daily[["date", "views"]]
 
 
-def render_channel_insights(
-    channel_row: Dict[str, Any],
-    videos_df: pd.DataFrame,
-    rpm_long: float,
-    rpm_shorts: float,
-):
+def render_channel_insights(channel_row: Dict[str, Any], videos_df: pd.DataFrame, rpm_long: float, rpm_shorts: float, market_hint: str):
     cid = safe_str(channel_row.get("channel_id")).strip()
     ch_name = safe_str(channel_row.get("title")).strip() or safe_str(channel_row.get("handle")).strip() or cid
     subs = int(channel_row.get("subscribers") or 0)
 
-    # time range selection
-    left, right = st.columns([0.75, 0.25])
+    left, right = st.columns([0.72, 0.28])
     with left:
-        st.subheader(f"📈 Channel Insights — {ch_name}")
-        st.caption("Bố cục mô phỏng NexLev. Một số mục là **ước tính** (không phải số thật).")
+        st.subheader(f"📊 Phân tích kênh — {ch_name}")
+        st.caption("Views/Like/Comment lấy từ DB (snapshots). Audience là ước tính.")
     with right:
-        window_key = st.radio("Khoảng", ["7D", "14D", "30D", "3M", "1Y"], horizontal=True, index=2, key="ins_window")
-    window_days = {"7D": 7, "14D": 14, "30D": 30, "3M": 90, "1Y": 365}[window_key]
+        window_sel = st.radio("Khoảng", ["7D", "14D", "30D", "3M", "1Y"], horizontal=True, index=2, key="ins_window")
 
-    m30 = compute_channel_window_metrics(videos_df, cid, rpm_long, rpm_shorts, window_days=30, max_videos=140)
-    rev30 = m30["rev"]
-    views30 = m30["views"]
+    delta30 = compute_window_deltas(videos_df, cid, window_days=30, max_videos=180)
+    views30 = int(delta30["views"])
+    shorts30 = int(delta30["shorts_views"])
+    long30 = int(delta30["long_views"])
+    rev30 = (long30 / 1000.0) * float(rpm_long) + (shorts30 / 1000.0) * float(rpm_shorts)
+    rpm_mix = (rpm_long + rpm_shorts) / 2.0
+    rpm_level = "Low" if rpm_mix < 2 else ("Medium" if rpm_mix < 4 else "High")
 
-    # RPM card label
-    rpm_level = "Low"
-    rpm_show = (rpm_long + rpm_shorts) / 2.0
-    if rpm_show >= 4:
-        rpm_level = "High"
-    elif rpm_show >= 2:
-        rpm_level = "Medium"
-
-    # Top row (3 cards)
     c1, c2, c3 = st.columns([1, 1, 1], gap="large")
     with c1:
-        nx_metric_card("Channel Revenue", "👁️", f"${rev30:,.0f}", "Last 30 Days (ước tính)", "reveal_rev")
+        metric_card("Channel Revenue", "💵", f"${rev30:,.0f}", "30 ngày (ước tính)", "rev")
     with c2:
-        nx_metric_card("Views", "👁️", f"{views30:,.0f}", "Last 30 Days", "reveal_views")
+        metric_card("Views", "👁️", f"{views30:,.0f}", "30 ngày", "views")
     with c3:
-        nx_metric_card("RPM", "💲", f"${rpm_show:.2f}", rpm_level, "reveal_rpm")
+        metric_card("RPM", "💲", f"${rpm_mix:.2f}", rpm_level, "rpm")
 
-    # Second row
     l2, r2 = st.columns([1.65, 1.0], gap="large")
     with l2:
         with st.container(border=True):
-            _ = card_start("Videos vs Shorts Views", "🎬", "reveal_vs", default_reveal=True)
-            total = max(1, m30["views"])
-            long_v = int(m30["long_views"])
-            short_v = int(m30["shorts_views"])
-            st.progress(min(1.0, long_v / total), text="Video Views")
-            st.write(f"• Video: **{fmt_num(long_v)}** ({(long_v/total)*100:.1f}%)")
-            st.write(f"• Shorts: **{fmt_num(short_v)}** ({(short_v/total)*100:.1f}%)")
-            st.caption(f"Dựa trên ~{m30.get('video_ids_used', 0)} video gần nhất trong DB.")
-    with r2:
-        # Estimated geos
-        lang = m30.get("lang", "unknown")
-        niche = m30.get("niche", "")
-        est = audience_estimator(lang=lang, niche=niche)
-        nx_bar_list("Top Geographies", "🌍", est["geos"], "reveal_geo", note="Ước tính theo ngôn ngữ/ngách (không phải YouTube Analytics).")
+            _ = card_header("Videos vs Shorts Views", "🎬", "vs", default_reveal=True)
+            total = max(1, views30)
+            st.progress(min(1.0, long30 / total), text="Video Views")
+            st.write(f"• Video: **{fmt_num(long30)}** ({(long30/total)*100:.1f}%)")
+            st.write(f"• Shorts: **{fmt_num(shorts30)}** ({(shorts30/total)*100:.1f}%)")
+            st.caption(f"Dựa trên ~{delta30.get('video_ids_used', 0)} video gần nhất trong DB.")
 
-    # Third row
+    with r2:
+        est = audience_estimator(delta30.get("lang", "unknown"), delta30.get("niche", ""), market_hint=market_hint)
+        with st.container(border=True):
+            _ = card_header("Top Geographies", "🌍", "geo", default_reveal=True)
+            st.caption("Ước tính theo language/ngách (không phải YouTube Analytics).")
+            for name, pct in est["geos"]:
+                a, b = st.columns([0.75, 0.25])
+                with a:
+                    st.write(name)
+                    st.progress(float(pct) / 100.0)
+                with b:
+                    st.write(f"{float(pct):.1f}%")
+
     l3, r3 = st.columns([1.65, 1.0], gap="large")
     with l3:
         with st.container(border=True):
-            _ = card_start("Views & Subscribers Graph", "📈", "reveal_graph", default_reveal=True)
-
+            _ = card_header("Views & Subscribers Graph", "📈", "graph", default_reveal=True)
             metric_mode = st.radio("Chỉ số", ["Views", "Subscribers"], horizontal=True, index=0, key="graph_metric")
-            # Use same window buttons as NexLev
-            window_sel = st.radio("Range", ["7D", "14D", "30D", "3M", "1Y"], horizontal=True, index=["7D","14D","30D","3M","1Y"].index(window_key), key="graph_range")
+            window_for_graph = st.radio("Range", ["7D", "14D", "30D", "3M", "1Y"], horizontal=True, index=["7D","14D","30D","3M","1Y"].index(window_sel), key="graph_range")
 
             if metric_mode == "Subscribers":
-                # No history => constant line
-                df = build_views_timeseries(videos_df, cid, window_sel, max_videos=60)
+                df = build_views_timeseries(videos_df, cid, window_for_graph, max_videos=60)
                 if df.empty:
                     st.info("Chưa đủ dữ liệu snapshots để vẽ.")
                 else:
-                    df2 = df.copy()
-                    df2["value"] = subs
-                    chart = (
-                        alt.Chart(df2)
-                        .mark_line()
-                        .encode(
-                            x=alt.X("date:T", title=None),
-                            y=alt.Y("value:Q", title=None),
-                            tooltip=[alt.Tooltip("date:T", title="Date"), alt.Tooltip("value:Q", title="Subscribers")],
-                        )
-                        .properties(height=260)
-                    )
+                    df["value"] = subs
+                    chart = alt.Chart(df).mark_line().encode(
+                        x=alt.X("date:T", title=None),
+                        y=alt.Y("value:Q", title=None),
+                        tooltip=[alt.Tooltip("date:T", title="Date"), alt.Tooltip("value:Q", title="Subscribers")],
+                    ).properties(height=260)
                     st.altair_chart(chart, use_container_width=True)
-                    st.caption("Subscribers history chưa có → hiển thị đường phẳng (cần lưu snapshot subscribers).")
+                    st.caption("Subscribers history chưa có → đường phẳng (khuyến nghị lưu subscriber snapshot).")
             else:
-                df = build_views_timeseries(videos_df, cid, window_sel, max_videos=80)
+                df = build_views_timeseries(videos_df, cid, window_for_graph, max_videos=80)
                 if df.empty:
                     st.info("Chưa đủ dữ liệu snapshots để vẽ.")
                 else:
-                    # Agg to monthly if 1Y
-                    if window_sel == "1Y":
-                        dfm = df.copy()
-                        dfm["month"] = dfm["date"].dt.to_period("M").dt.to_timestamp()
-                        dfm = dfm.groupby("month")["views"].sum().reset_index().rename(columns={"month": "date"})
-                        df = dfm
-                    chart = (
-                        alt.Chart(df)
-                        .mark_area(line={"color": "#34d399", "strokeWidth": 2}, opacity=0.45)
-                        .encode(
-                            x=alt.X("date:T", title=None),
-                            y=alt.Y("views:Q", title=None),
-                            tooltip=[alt.Tooltip("date:T", title="Date"), alt.Tooltip("views:Q", title="Views")],
-                        )
-                        .properties(height=260)
-                    )
+                    chart = alt.Chart(df).mark_area(line={"color": "#34d399", "strokeWidth": 2}, opacity=0.45).encode(
+                        x=alt.X("date:T", title=None),
+                        y=alt.Y("views:Q", title=None),
+                        tooltip=[alt.Tooltip("date:T", title="Date"), alt.Tooltip("views:Q", title="Views")],
+                    ).properties(height=260)
                     st.altair_chart(chart, use_container_width=True)
                     st.caption("Views = tăng trưởng theo ngày dựa trên snapshots (ước tính).")
+
+            st.divider()
+
+            ch = videos_df[videos_df["channel_id"].astype(str) == str(cid)].copy()
+            ch = ensure_df_columns(ch, {"view_count": 0, "title": "", "published_at": "", "tags_json": ""})
+            ch = coerce_int(ch, ["view_count"])
+            total_views_db = int(ch["view_count"].sum())
+            avg_views = int(ch["view_count"].mean()) if len(ch) else 0
+
+            last_upload_iso = ""
+            earliest_iso = ""
+            if len(ch):
+                dd = pd.to_datetime(ch["published_at"].astype(str).str.replace("Z", "+00:00"), utc=True, errors="coerce")
+                if dd.notna().any():
+                    last_upload_iso = dd.max().isoformat()
+                    earliest_iso = dd.min().isoformat()
+
+            last_upload = time_ago_vi(last_upload_iso) if last_upload_iso else "Không áp dụng"
+            days_since = "—"
+            if earliest_iso:
+                dt0 = parse_dt_any(earliest_iso)
+                if dt0:
+                    days_since = str(int((utc_now() - dt0).total_seconds() / 86400))
+
+            avg_monthly = "—"
+            if len(ch):
+                dd = pd.to_datetime(ch["published_at"].astype(str).str.replace("Z", "+00:00"), utc=True, errors="coerce")
+                dd = dd.dropna()
+                last90 = dd[dd >= (utc_now() - timedelta(days=90))]
+                avg_monthly = f"{(len(last90)/3.0):.2f}" if len(last90) else "0.00"
+
+            shorts_cnt = 0
+            if len(ch):
+                shorts_cnt = int(ch.apply(lambda r: is_shorts_guess(str(r["title"]), str(r["tags_json"])), axis=1).sum())
+            has_shorts = "Đúng" if shorts_cnt > 0 else "Không"
+            title_len = int(ch["title"].astype(str).str.len().mean()) if len(ch) else 0
+
+            items = [
+                ("👁️", "Tổng lượt xem", f"{total_views_db:,}", "Trong DB (video đã lưu)"),
+                ("🗓️", "Lần tải lên cuối", f"{last_upload}", "Theo published_at"),
+                ("⏱️", "Số ngày kể từ video đầu", f"{days_since}", "Trong DB"),
+                ("📈", "Views TB / video", f"{avg_views:,}", "Trong DB"),
+                ("📤", "Uploads TB/tháng", f"{avg_monthly}", "Ước tính (90 ngày)"),
+                ("🔤", "Độ dài tiêu đề TB", f"{title_len} ký tự", "Trong DB"),
+                ("🎞️", "Có shorts", f"{has_shorts}", f"{shorts_cnt} video shorts"),
+                ("🏷️", "Ngách (AI)", safe_str(delta30.get("niche", "")) or "—", "Theo videos.niche"),
+            ]
+            mini_cards_block(items)
+
     with r3:
-        # Age/Gender estimated
-        lang = m30.get("lang", "unknown")
-        niche = m30.get("niche", "")
-        est = audience_estimator(lang=lang, niche=niche)
+        est = audience_estimator(delta30.get("lang", "unknown"), delta30.get("niche", ""), market_hint=market_hint)
         with st.container(border=True):
-            _ = card_start("Age and Gender", "👥", "reveal_demo", default_reveal=True)
+            _ = card_header("Age and Gender", "👥", "demo", default_reveal=True)
             g = est["gender"]
-            # gender bars
             for k in ["Male", "Female", "User-specified"]:
                 pct = float(g.get(k, 0))
-                left, right = st.columns([0.75, 0.25])
-                with left:
+                a, b = st.columns([0.75, 0.25])
+                with a:
                     st.write(k)
                     st.progress(pct / 100.0)
-                with right:
+                with b:
                     st.write(f"{pct:.1f}%")
             st.divider()
             for name, pct in est["ages"]:
-                left, right = st.columns([0.75, 0.25])
-                with left:
+                a, b = st.columns([0.75, 0.25])
+                with a:
                     st.write(name)
                     st.progress(float(pct) / 100.0)
-                with right:
+                with b:
                     st.write(f"{float(pct):.1f}%")
-            st.caption("⚠️ Đây là ước tính theo language/ngách, không phải số thật.")
+            st.caption("⚠️ Ước tính. Muốn số thật => YouTube Analytics API (OAuth).")
 
 
-def render_video_cards(
-    videos: pd.DataFrame,
-    channels: pd.DataFrame,
-    rpm_long: float,
-    rpm_shorts: float,
-    viral_rel_threshold: float,
-    columns: int = 4,
-):
+def render_video_cards(videos: pd.DataFrame, channels: pd.DataFrame, rpm_long: float, rpm_shorts: float, viral_rel_threshold: float, columns: int = 4):
     if videos.empty:
         st.info("Chưa có video trong bảng videos. Chờ robot scraper chạy.")
         return
@@ -908,9 +837,9 @@ def render_video_cards(
             url = YOUTUBE_WATCH + vid if vid else "#"
             thumb = YOUTUBE_THUMB.format(vid=vid) if vid else ""
 
-            views = int(r["view_count"])
-            likes = int(r["like_count"])
-            comments = int(r["comment_count"])
+            views = int(r.get("view_count", 0) or 0)
+            likes = int(r.get("like_count", 0) or 0)
+            comments = int(r.get("comment_count", 0) or 0)
 
             ch_name = ch_map.get(cid, {}).get("name", cid or "(unknown)")
             subs = int(ch_map.get(cid, {}).get("subs", 0))
@@ -950,18 +879,13 @@ def render_video_cards(
                 '</div>',
                 '</a>',
             ]
-            html = "\n".join([ln for ln in lines if ln and ln != "None"])
-            st.markdown(html, unsafe_allow_html=True)
+            st.markdown("\n".join(lines), unsafe_allow_html=True)
 
 
-# -------------------------
-# Main
-# -------------------------
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide", initial_sidebar_state="expanded")
     inject_css()
 
-    # Top bar
     st.markdown(
         """
 <div class="tw-top">
@@ -975,28 +899,32 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # Sidebar
     st.sidebar.header("⚙️ Điều khiển")
     if st.sidebar.button("🔄 Refresh dữ liệu", use_container_width=True):
-        fetch_channels.clear()
-        fetch_videos.clear()
-        fetch_latest_video_snapshots.clear()
-        fetch_snapshots_since.clear()
-        fetch_latest_scan_time.clear()
+        clear_caches()
         st.rerun()
 
     st.sidebar.subheader("🛰️ Trạng thái robot")
     last_scan = fetch_latest_scan_time()
+    state = fetch_scraper_state()
+
     if last_scan:
-        st.sidebar.caption(f"Lần cập nhật gần nhất: **{time_ago_vi(last_scan)}**")
+        st.sidebar.caption(f"Lần cập nhật snapshots gần nhất: **{time_ago_vi(last_scan)}**")
         dt = parse_dt_any(last_scan)
         if dt:
             elapsed = max(0.0, (utc_now() - dt).total_seconds())
-            cycle = 4 * 3600.0
-            pct = min(1.0, elapsed / cycle)
-            st.sidebar.progress(pct, text=f"Chu kỳ 4 giờ: {int(pct*100)}%")
+            pct = min(1.0, elapsed / float(SCAN_INTERVAL_SECONDS))
+            st.sidebar.progress(pct, text=f"Chu kỳ 1 giờ: {int(pct*100)}%")
+            if elapsed > 5400:
+                st.sidebar.warning("⚠️ Dữ liệu lâu chưa cập nhật. Kiểm tra GitHub Actions.")
     else:
         st.sidebar.caption("Chưa thấy dữ liệu scan (snapshots rỗng).")
+
+    if state:
+        st.sidebar.caption("scraper_state (best effort):")
+        for k in ["status", "message", "updated_at", "last_run_at", "run_started_at", "progress", "pct"]:
+            if k in state and state.get(k) not in (None, ""):
+                st.sidebar.write(f"- **{k}**: {state.get(k)}")
 
     st.sidebar.divider()
     st.sidebar.subheader("➕ Thêm kênh")
@@ -1008,7 +936,6 @@ def main():
     st.sidebar.divider()
     st.sidebar.subheader("🗑️ Xoá kênh")
     ch_df = fetch_channels()
-
     sel_row: Optional[Dict[str, Any]] = None
     if ch_df.empty:
         st.sidebar.info("Chưa có kênh.")
@@ -1038,16 +965,16 @@ def main():
     rpm_shorts = st.sidebar.slider("RPM Shorts ($/1000 views)", 0.01, 5.0, 0.2, 0.01, key="rpm_shorts_val")
     viral_rel_threshold = st.sidebar.slider("Ngưỡng viral (Views/Subs ≥)", 1.0, 20.0, 3.0, 0.5, key="viral_threshold")
 
-    # Load data
-    videos_df = fetch_videos(limit=320)
-    videos_df = ensure_df_columns(
-        videos_df,
-        {"video_id": "", "channel_id": "", "published_at": "", "title": "", "description": "", "tags_json": "", "niche": "", "sentiment": ""},
-    )
+    st.sidebar.divider()
+    st.sidebar.subheader("🌍 Audience (ước tính)")
+    market_hint = st.sidebar.selectbox("Thị trường chính", ["Auto", "VN", "US/EN", "Global"], index=0, key="market_hint")
 
-    # Attach latest snapshot metrics to videos_df
+    videos_df = fetch_videos(limit=420)
+    videos_df = ensure_df_columns(videos_df, {"video_id": "", "channel_id": "", "published_at": "", "title": "", "description": "", "tags_json": "", "niche": "", "sentiment": ""})
+
     vid_ids_all = [str(x) for x in videos_df["video_id"].astype(str).tolist() if str(x).strip()]
     latest_snap = fetch_latest_video_snapshots(vid_ids_all) if vid_ids_all else pd.DataFrame()
+
     videos_df = ensure_df_columns(videos_df, {"view_count": 0, "like_count": 0, "comment_count": 0})
 
     if not latest_snap.empty:
@@ -1065,20 +992,16 @@ def main():
     else:
         videos_df = coerce_int(videos_df, ["view_count", "like_count", "comment_count"])
 
-    # Auto rpm suggestion
     if auto_rpm:
         sug = auto_rpm_estimate(videos_df)
         st.sidebar.info(f"Gợi ý: Long ≈ ${sug['rpm_long']:.2f} | Shorts ≈ ${sug['rpm_shorts']:.2f}")
 
-    # Tabs
     tab1, tab2, tab3 = st.tabs(["📺 Tổng quan Video", "🚀 Outlier Finder", "👥 Kênh Đối thủ"])
 
     with tab1:
-        # choose channel for insights
         if ch_df.empty:
             st.info("Chưa có kênh. Thêm kênh ở sidebar.")
         else:
-            # channel selector like NexLev context
             label_map = []
             row_map = {}
             for _, rr in ch_df.iterrows():
@@ -1089,9 +1012,8 @@ def main():
                 label_map.append(key)
                 row_map[key] = row
             pick = st.selectbox("Chọn kênh để xem phân tích", options=label_map, index=0, key="ins_channel_pick")
-            render_channel_insights(row_map[pick], videos_df, rpm_long=rpm_long, rpm_shorts=rpm_shorts)
+            render_channel_insights(row_map[pick], videos_df, rpm_long=rpm_long, rpm_shorts=rpm_shorts, market_hint=market_hint)
 
-        # quick counters
         st.divider()
         c1, c2, c3 = st.columns(3)
         c1.metric("Tổng kênh", f"{len(ch_df):,}")
@@ -1099,7 +1021,6 @@ def main():
         c3.metric("Tổng subscribers", fmt_num(int(ch_df["subscribers"].sum()) if not ch_df.empty else 0))
         st.divider()
 
-        # controls
         f1, f2, f3 = st.columns([0.55, 0.22, 0.23])
         q = f1.text_input("Tìm theo tiêu đề", value="", placeholder="Search…", key="search_title")
         sort_mode = f2.selectbox("Sắp xếp", ["Mới nhất", "Nhiều view"], index=0, key="sort_mode")
