@@ -3,14 +3,11 @@
 """
 toolwatch (Streamlit Frontend-only) — Supabase
 
-✅ Không dùng sqlite3
+Mục tiêu: UI dark + sidebar gọn giống NexLev (ở mức Streamlit cho phép).
+✅ Không sqlite3
 ✅ Không gọi YouTube API (chỉ SELECT/INSERT/DELETE Supabase)
-✅ Sidebar luôn hiện (không collapse, không có nút <<)
-✅ Chạy mượt kể cả DB trống
-✅ Hiển thị:
-  - Tab 1: Tổng quan Video (grid/card)
-  - Tab 2: Outlier Finder (7 ngày: views >= 3x subs)
-  - Tab 3: Kênh đối thủ (list kênh + subs)
+✅ Sidebar luôn hiện, ẩn nút << (collapse)
+✅ DB trống vẫn chạy
 """
 
 from __future__ import annotations
@@ -109,13 +106,6 @@ def coerce_int(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
 
 
 def extract_channel_input(s: str) -> Dict[str, Optional[str]]:
-    """
-    Accept:
-    - UC... (channel_id)
-    - https://youtube.com/channel/UC...
-    - @handle
-    - https://youtube.com/@handle
-    """
     s = (s or "").strip()
     if not s:
         return {"channel_id": None, "handle": None}
@@ -137,17 +127,12 @@ def extract_channel_input(s: str) -> Dict[str, Optional[str]]:
     return {"channel_id": None, "handle": None}
 
 
-def is_shorts_guess(title: str, tags_json: str) -> bool:
-    t = (title or "").lower()
-    if "#shorts" in t or "shorts" in t:
-        return True
-    tj = (tags_json or "").lower()
-    return '"shorts"' in tj or "shorts" in tj
-
-
 def detect_vietnamese(text: str) -> bool:
     return bool(
-        re.search(r"[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]", (text or "").lower())
+        re.search(
+            r"[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]",
+            (text or "").lower(),
+        )
     )
 
 
@@ -171,10 +156,15 @@ def guess_lang_from_titles(titles: List[str]) -> str:
     return "mixed"
 
 
+def is_shorts_guess(title: str, tags_json: str) -> bool:
+    t = (title or "").lower()
+    if "#shorts" in t or "shorts" in t:
+        return True
+    tj = (tags_json or "").lower()
+    return '"shorts"' in tj or "shorts" in tj
+
+
 def auto_rpm_estimate(videos_df: pd.DataFrame) -> Dict[str, float]:
-    """
-    Heuristic RPM auto estimate (không phải số thật).
-    """
     if videos_df.empty:
         return {"rpm_long": 1.5, "rpm_shorts": 0.2}
 
@@ -190,15 +180,11 @@ def auto_rpm_estimate(videos_df: pd.DataFrame) -> Dict[str, float]:
     comm_sum = int(v["comment_count"].sum())
     eng = (likes_sum + comm_sum) / max(1, views_sum)
 
-    if lang == "en":
-        base_long = 3.5
-    elif lang == "vi":
-        base_long = 1.8
-    else:
-        base_long = 2.4
-
+    base_long = 3.5 if lang == "en" else (1.8 if lang == "vi" else 2.4)
     base_long += min(2.0, max(0.0, (eng - 0.01) * 80))
-    base_shorts = (0.15 if lang == "vi" else (0.35 if lang == "en" else 0.25)) + min(0.6, max(0.0, (eng - 0.008) * 60))
+    base_shorts = (0.15 if lang == "vi" else (0.35 if lang == "en" else 0.25)) + min(
+        0.6, max(0.0, (eng - 0.008) * 60)
+    )
 
     rpm_long = float(max(0.3, min(12.0, base_long)))
     rpm_shorts = float(max(0.03, min(2.0, base_shorts)))
@@ -230,17 +216,16 @@ def fetch_channels() -> pd.DataFrame:
     df = pd.DataFrame(res.data or [])
     if df.empty:
         df = pd.DataFrame(columns=["id", "channel_id", "title", "handle", "avatar_url", "subscribers", "created_at"])
-    df = ensure_df_columns(df, {"id": None, "channel_id": "", "title": "", "handle": "", "avatar_url": "", "subscribers": 0, "created_at": ""})
+    df = ensure_df_columns(
+        df,
+        {"id": None, "channel_id": "", "title": "", "handle": "", "avatar_url": "", "subscribers": 0, "created_at": ""},
+    )
     df = coerce_int(df, ["subscribers"])
     return df
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_videos(limit: int = 120) -> pd.DataFrame:
-    """
-    Schema:
-    videos: video_id, channel_id, published_at, title, description, tags_json, niche, sentiment (optional)
-    """
+def fetch_videos(limit: int = 200) -> pd.DataFrame:
     client = supa()
     res = None
     for col in ("published_at", "video_id", None):
@@ -256,9 +241,10 @@ def fetch_videos(limit: int = 120) -> pd.DataFrame:
     df = pd.DataFrame((res.data if res else []) or [])
     if df.empty:
         df = pd.DataFrame(columns=["video_id", "channel_id", "published_at", "title", "description", "tags_json", "niche", "sentiment"])
-    df = ensure_df_columns(df, {
-        "video_id": "", "channel_id": "", "published_at": "", "title": "", "description": "", "tags_json": "", "niche": "", "sentiment": ""
-    })
+    df = ensure_df_columns(
+        df,
+        {"video_id": "", "channel_id": "", "published_at": "", "title": "", "description": "", "tags_json": "", "niche": "", "sentiment": ""},
+    )
     return df
 
 
@@ -272,7 +258,7 @@ def fetch_latest_video_snapshots(video_ids: List[str]) -> pd.DataFrame:
     CHUNK = 150
 
     for i in range(0, len(video_ids), CHUNK):
-        chunk = video_ids[i:i+CHUNK]
+        chunk = video_ids[i : i + CHUNK]
         try:
             r = (
                 client.table("snapshots")
@@ -322,15 +308,6 @@ def fetch_latest_scan_time() -> Optional[str]:
             return str(row["captured_at"])
     except Exception:
         pass
-
-    try:
-        r = client.table("videos").select("published_at").order("published_at", desc=True).limit(1).execute()
-        row = (r.data or [None])[0]
-        if row and row.get("published_at"):
-            return str(row["published_at"])
-    except Exception:
-        pass
-
     return None
 
 
@@ -343,7 +320,7 @@ def add_channel_row(user_input: str) -> Tuple[bool, str]:
     handle = info["handle"]
 
     if not cid and not handle:
-        return False, "Nhập UC... hoặc URL /channel/UC... hoặc @handle (vd: @MrBeast)."
+        return False, "Nhập UC... hoặc URL /channel/UC... hoặc @handle."
 
     payload: Dict[str, Any] = {}
     if cid:
@@ -362,7 +339,7 @@ def add_channel_row(user_input: str) -> Tuple[bool, str]:
         fetch_videos.clear()
         fetch_latest_video_snapshots.clear()
         fetch_latest_scan_time.clear()
-        return True, "✅ Đã thêm. Robot sẽ tự quét và đổ dữ liệu vào videos/snapshots."
+        return True, "✅ Đã thêm. Robot sẽ tự quét và đổ data vào videos/snapshots."
     except Exception as e:
         return False, f"❌ Thêm kênh thất bại: {e}"
 
@@ -401,110 +378,142 @@ def delete_channel_by_row(row: Dict[str, Any], delete_children: bool = True) -> 
 
 
 # -------------------------
-# CSS / UI
+# CSS (NexLev-ish)
 # -------------------------
 def inject_css():
     st.markdown(
         """
-        <style>
-          header[data-testid="stHeader"]{ background: transparent !important; }
-          div[data-testid="stToolbar"]{ display:none !important; }
-          #MainMenu{ visibility:hidden; }
-          footer{ visibility:hidden; }
+<style>
+  header[data-testid="stHeader"]{ background: transparent !important; }
+  div[data-testid="stToolbar"]{ display:none !important; }
+  #MainMenu{ visibility:hidden; }
+  footer{ visibility:hidden; }
 
-          /* FORCE SIDEBAR ALWAYS VISIBLE + REMOVE << */
-          section[data-testid="stSidebar"]{
-            transform:none !important;
-            margin-left:0 !important;
-            visibility:visible !important;
-            opacity:1 !important;
-            display:block !important;
-          }
-          section[data-testid="stSidebar"][aria-expanded="false"]{ transform:none !important; }
-          div[data-testid="collapsedControl"]{ display:none !important; } /* remove << */
+  /* Sidebar: always expanded + remove collapse button */
+  section[data-testid="stSidebar"]{
+    transform:none !important;
+    margin-left:0 !important;
+    visibility:visible !important;
+    opacity:1 !important;
+    display:block !important;
+    width: 300px !important;
+    min-width: 300px !important;
+  }
+  section[data-testid="stSidebar"][aria-expanded="false"]{ transform:none !important; }
+  div[data-testid="collapsedControl"]{ display:none !important; }
+  [data-testid="stSidebarCollapseButton"]{ display:none !important; }
+  button[title="Collapse sidebar"], button[aria-label="Collapse sidebar"], button[aria-label="Close sidebar"]{ display:none !important; }
+  section[data-testid="stSidebar"] button[kind="headerNoPadding"]{ display:none !important; }
 
-          @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap');
-          html, body, [class*="css"]{ font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif !important; }
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap');
+  html, body, [class*="css"]{ font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif !important; }
 
-          .stApp{
-            background: linear-gradient(180deg, #0b0b0b 0%, #090909 100%);
-            color: rgba(230,232,238,0.92);
-          }
-          .block-container{ max-width: 1500px; padding-top: 0.8rem; padding-bottom: 2rem; }
+  .stApp{
+    background: radial-gradient(1200px 500px at 30% 10%, rgba(255,255,255,0.06) 0%, rgba(0,0,0,0.0) 55%),
+                linear-gradient(180deg, #0b0b0b 0%, #090909 100%);
+    color: rgba(230,232,238,0.92);
+  }
+  .block-container{ max-width: 1500px; padding-top: 0.6rem; padding-bottom: 2rem; }
 
-          .tw-top{
-            display:flex; align-items:center; justify-content:space-between;
-            padding: 10px 12px; border-radius: 16px;
-            border: 1px solid rgba(255,255,255,0.10);
-            background: rgba(255,255,255,0.02);
-            margin-bottom: 14px;
-          }
-          .tw-brand{ font-weight: 900; font-size: 18px; }
-          .tw-pill{
-            padding: 6px 10px; border-radius: 999px;
-            border: 1px solid rgba(255,255,255,0.12);
-            background: rgba(255,255,255,0.03);
-            font-weight: 800; font-size: 12px;
-          }
+  .tw-top{
+    display:flex; align-items:center; justify-content:space-between;
+    padding: 10px 12px; border-radius: 16px;
+    border: 1px solid rgba(255,255,255,0.10);
+    background: rgba(255,255,255,0.02);
+    margin-bottom: 10px;
+  }
+  .tw-brand{ font-weight: 900; font-size: 18px; }
+  .tw-pill{
+    padding: 6px 10px; border-radius: 999px;
+    border: 1px solid rgba(255,255,255,0.12);
+    background: rgba(255,255,255,0.03);
+    font-weight: 800; font-size: 12px;
+  }
 
-          .tw-grid{
-            display: grid !important;
-            width: 100% !important;
-            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-            gap: 16px;
-            align-items: start;
-          }
-          .tw-card{ border-radius: 16px; min-width: 0; }
-          .tw-thumb{
-            position:relative; width:100%; aspect-ratio:16/9;
-            border-radius: 16px; overflow:hidden;
-            border:1px solid rgba(255,255,255,0.10);
-            background: rgba(255,255,255,0.04);
-          }
-          .tw-thumb img{ width:100%; height:100%; object-fit:cover; object-position:center; display:block; }
-          .tw-badge{
-            position:absolute; left:10px; top:10px;
-            padding: 3px 8px; border-radius: 999px;
-            font-weight: 900; font-size: 12px;
-            border: 1px solid rgba(34,197,94,0.45);
-            background: rgba(34,197,94,0.12);
-            color: #86efac;
-          }
-          .tw-meta{ padding: 8px 2px 0 2px; }
-          .tw-title{
-            font-weight: 900; font-size: 14px; line-height: 1.25;
-            display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
-            overflow:hidden; min-height: 36px;
-          }
-          .tw-sub{
-            margin-top: 6px;
-            color: rgba(230,232,238,0.65);
-            font-size: 12px;
-            white-space: nowrap; overflow:hidden; text-overflow:ellipsis;
-          }
-          .tw-metrics{
-            margin-top: 6px;
-            color: rgba(230,232,238,0.78);
-            font-size: 12px;
-            display:flex; gap:10px; flex-wrap:wrap;
-          }
-          .tw-metrics b{ color: rgba(230,232,238,0.92); }
-          .tw-open{ text-decoration:none; color: inherit; }
-        </style>
+  /* Video card (NexLev-ish) */
+  .tw-card{
+    border-radius: 16px;
+    border: 1px solid rgba(255,255,255,0.10);
+    background: rgba(255,255,255,0.02);
+    overflow:hidden;
+  }
+  .tw-thumb{
+    position:relative;
+    width:100%;
+    aspect-ratio:16/9;
+    background: rgba(255,255,255,0.05);
+  }
+  .tw-thumb img{
+    width:100%;
+    height:100%;
+    object-fit:cover;
+    object-position:center;
+    display:block;
+  }
+  .tw-badge{
+    position:absolute;
+    left:10px; top:10px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    font-weight: 900;
+    font-size: 12px;
+    border: 1px solid rgba(34,197,94,0.45);
+    background: rgba(34,197,94,0.12);
+    color: #86efac;
+    backdrop-filter: blur(8px);
+  }
+  .tw-meta{ padding: 10px 12px 12px 12px; }
+  .tw-title{
+    font-weight: 900;
+    font-size: 14px;
+    line-height: 1.25;
+    display:-webkit-box;
+    -webkit-line-clamp:2;
+    -webkit-box-orient:vertical;
+    overflow:hidden;
+    min-height: 36px;
+  }
+  .tw-sub{
+    margin-top: 6px;
+    color: rgba(230,232,238,0.65);
+    font-size: 12px;
+    white-space: nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+  }
+  .tw-badges{
+    margin-top: 8px;
+    display:flex;
+    gap:6px;
+    flex-wrap:wrap;
+  }
+  .tw-chip{
+    padding: 3px 8px;
+    border-radius: 999px;
+    border: 1px solid rgba(255,255,255,0.10);
+    background: rgba(255,255,255,0.03);
+    font-size: 12px;
+    font-weight: 800;
+    color: rgba(230,232,238,0.82);
+  }
+  .tw-chip b{ color: rgba(230,232,238,0.95); }
+  a.tw-open{ text-decoration:none; color: inherit; display:block; }
+</style>
         """,
         unsafe_allow_html=True,
     )
 
 
-def render_video_grid(
+def render_video_cards(
     videos: pd.DataFrame,
     channels: pd.DataFrame,
     rpm_long: float,
     rpm_shorts: float,
     viral_rel_threshold: float,
+    columns: int = 4,
 ):
     if videos.empty:
-        st.info("Chưa có video trong bảng videos. (Chờ robot scraper chạy và đổ data)")
+        st.info("Chưa có video trong bảng videos. Chờ robot scraper chạy.")
         return
 
     ch_map: Dict[str, Dict[str, Any]] = {}
@@ -514,35 +523,44 @@ def render_video_grid(
             name = safe_str(r["title"]).strip() or safe_str(r["handle"]).strip() or cid or "(unknown)"
             ch_map[cid] = {"name": name, "subs": int(r["subscribers"])}
 
-    parts = ["<div class=\"tw-grid\" style=\"width:100%\">\n"]
-    for _, r in videos.iterrows():
-        vid = safe_str(r["video_id"]).strip()
-        cid = safe_str(r["channel_id"]).strip()
-        title = safe_str(r["title"])
-        published_at = safe_str(r["published_at"])
-        ago = time_ago_vi(published_at)
+    cols = st.columns(int(columns), gap="large")
 
-        url = YOUTUBE_WATCH + vid if vid else "#"
-        thumb = YOUTUBE_THUMB.format(vid=vid) if vid else ""
+    for idx, (_, r) in enumerate(videos.iterrows()):
+        col = cols[idx % int(columns)]
+        with col:
+            vid = safe_str(r["video_id"]).strip()
+            cid = safe_str(r["channel_id"]).strip()
+            title = safe_str(r["title"])
+            published_at = safe_str(r["published_at"])
+            ago = time_ago_vi(published_at)
 
-        views = int(r["view_count"])
-        likes = int(r["like_count"])
-        comments = int(r["comment_count"])
+            url = YOUTUBE_WATCH + vid if vid else "#"
+            thumb = YOUTUBE_THUMB.format(vid=vid) if vid else ""
 
-        ch_name = ch_map.get(cid, {}).get("name", cid or "(unknown)")
-        subs = int(ch_map.get(cid, {}).get("subs", 0))
-        rel = (views / max(1, subs)) if subs > 0 else 0.0
-        viral = rel >= float(viral_rel_threshold)
+            views = int(r["view_count"])
+            likes = int(r["like_count"])
+            comments = int(r["comment_count"])
 
-        tags_json = safe_str(r.get("tags_json", ""))
-        rpm = rpm_shorts if is_shorts_guess(title, tags_json) else rpm_long
-        rev = (views / 1000.0) * float(rpm)
+            ch_name = ch_map.get(cid, {}).get("name", cid or "(unknown)")
+            subs = int(ch_map.get(cid, {}).get("subs", 0))
+            rel = (views / max(1, subs)) if subs > 0 else 0.0
+            viral = rel >= float(viral_rel_threshold)
 
-        badge = "<div class='tw-badge'>✅🔥 VIRAL</div>" if viral else ""
+            tags_json = safe_str(r.get("tags_json", ""))
+            rpm = rpm_shorts if is_shorts_guess(title, tags_json) else rpm_long
+            rev = (views / 1000.0) * float(rpm)
 
-        parts.append(textwrap.dedent(f"""\
-<div class="tw-card">
-  <a class="tw-open" href="{url}" target="_blank" rel="noopener">
+            dt = parse_dt_any(published_at) or utc_now()
+            hours = max(1.0, (utc_now() - dt).total_seconds() / 3600.0)
+            vph = views / hours
+            eng = (likes + comments) / max(1, views) * 100.0
+
+            badge = "<div class='tw-badge'>✅🔥 VIRAL</div>" if viral else ""
+
+            html = textwrap.dedent(
+                f"""\
+<a class="tw-open" href="{url}" target="_blank" rel="noopener">
+  <div class="tw-card">
     <div class="tw-thumb">
       <img src="{thumb}" />
       {badge}
@@ -550,41 +568,43 @@ def render_video_grid(
     <div class="tw-meta">
       <div class="tw-title">{title}</div>
       <div class="tw-sub">{ch_name} • {fmt_num(views)} lượt xem • {ago}</div>
-      <div class="tw-metrics">
-        <span>👁️ <b>{views:,}</b></span>
-        <span>👍 <b>{likes:,}</b></span>
-        <span>💬 <b>{comments:,}</b></span>
-        <span>💵 <b>≈${rev:,.2f}</b></span>
+      <div class="tw-badges">
+        <span class="tw-chip">👁️ <b>{fmt_num(views)}</b></span>
+        <span class="tw-chip">👍 <b>{fmt_num(likes)}</b></span>
+        <span class="tw-chip">💬 <b>{fmt_num(comments)}</b></span>
+        <span class="tw-chip">⚡ <b>{fmt_num(int(vph))}</b>/giờ</span>
+        <span class="tw-chip">💡 <b>{eng:.1f}%</b></span>
+        <span class="tw-chip">💵 <b>≈${rev:,.2f}</b></span>
       </div>
     </div>
-  </a>
-</div>
-"""))
+  </div>
+</a>
+"""
+            )
+            st.markdown(html, unsafe_allow_html=True)
 
-    parts.append("\n</div>")
-    st.markdown("\n".join(parts), unsafe_allow_html=True)
 
-
+# -------------------------
+# Main
+# -------------------------
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide", initial_sidebar_state="expanded")
     inject_css()
 
     st.markdown(
         """
-        <div class="tw-top">
-          <div class="tw-brand">toolwatch • NexLev-style (Supabase)</div>
-          <div style="display:flex; gap:10px;">
-            <div class="tw-pill">Frontend only</div>
-            <div class="tw-pill">No YouTube API</div>
-          </div>
-        </div>
+<div class="tw-top">
+  <div class="tw-brand">toolwatch • NexLev-style (Supabase)</div>
+  <div style="display:flex; gap:10px;">
+    <div class="tw-pill">Frontend only</div>
+    <div class="tw-pill">No YouTube API</div>
+  </div>
+</div>
         """,
         unsafe_allow_html=True,
     )
 
-    # Sidebar
     st.sidebar.header("⚙️ Điều khiển")
-
     if st.sidebar.button("🔄 Refresh dữ liệu", use_container_width=True):
         fetch_channels.clear()
         fetch_videos.clear()
@@ -603,23 +623,17 @@ def main():
             pct = min(1.0, elapsed / cycle)
             st.sidebar.progress(pct, text=f"Chu kỳ 4 giờ: {int(pct*100)}%")
     else:
-        st.sidebar.caption("Chưa thấy dữ liệu scan (snapshots/videos rỗng).")
+        st.sidebar.caption("Chưa thấy dữ liệu scan (snapshots rỗng).")
 
     if st.sidebar.button("🧪 Test DB (đếm rows)", use_container_width=True):
         client = supa()
-        try:
-            c = client.table("channels").select("id", count="exact").execute().count
-        except Exception:
-            c = "?"
-        try:
-            v = client.table("videos").select("video_id", count="exact").execute().count
-        except Exception:
-            v = "?"
-        try:
-            s = client.table("snapshots").select("video_id", count="exact").execute().count
-        except Exception:
-            s = "?"
-        st.sidebar.write({"channels": c, "videos": v, "snapshots": s})
+        out = {}
+        for name, key in [("channels", "id"), ("videos", "video_id"), ("snapshots", "video_id")]:
+            try:
+                out[name] = client.table(name).select(key, count="exact").execute().count
+            except Exception:
+                out[name] = "?"
+        st.sidebar.write(out)
 
     st.sidebar.divider()
 
@@ -647,7 +661,6 @@ def main():
             key = f"{label} • {cid} • id={rid}"
             options.append(key)
             row_map[key] = row
-
         pick = st.sidebar.selectbox("Chọn kênh", options=options, key="delete_channel_pick")
         sel_row = row_map.get(pick)
 
@@ -656,7 +669,6 @@ def main():
         ok, msg = delete_channel_by_row(sel_row, delete_children=delete_children)
         (st.sidebar.success if ok else st.sidebar.error)(msg)
 
-    # RPM
     st.sidebar.divider()
     st.sidebar.subheader("💵 RPM (ước tính)")
     auto_rpm = st.sidebar.toggle("Tự động gợi ý RPM", value=True, key="auto_rpm_toggle")
@@ -664,17 +676,14 @@ def main():
     rpm_shorts = st.sidebar.slider("RPM Shorts ($/1000 views)", 0.01, 5.0, float(st.session_state.get("rpm_shorts_val", 0.2)), 0.01, key="rpm_shorts_val")
     viral_rel_threshold = st.sidebar.slider("Ngưỡng viral (Views/Subs ≥)", 1.0, 20.0, 3.0, 0.5, key="viral_threshold")
 
-    # Load data
-    videos_df = fetch_videos(limit=int(st.secrets.get("DEFAULT_VIDEO_LIMIT", 120)))
+    videos_df = fetch_videos(limit=240)
     if videos_df.empty:
         videos_df = pd.DataFrame(columns=["video_id", "channel_id", "published_at", "title", "description", "tags_json", "niche", "sentiment"])
     videos_df = ensure_df_columns(videos_df, {"video_id": "", "channel_id": "", "published_at": "", "title": "", "description": "", "tags_json": "", "niche": "", "sentiment": ""})
 
-    # Gắn metrics mới nhất từ snapshots vào videos (view/like/comment)
     vid_ids = [str(x) for x in videos_df["video_id"].astype(str).tolist() if str(x).strip()]
     snap_df = fetch_latest_video_snapshots(vid_ids) if vid_ids else pd.DataFrame()
 
-    # Luôn đảm bảo có 3 cột metrics để UI không crash
     videos_df = ensure_df_columns(videos_df, {"view_count": 0, "like_count": 0, "comment_count": 0})
 
     if not snap_df.empty:
@@ -685,13 +694,7 @@ def main():
         base["video_id"] = base["video_id"].astype(str)
         snap_df["video_id"] = snap_df["video_id"].astype(str)
 
-        merged = base.merge(
-            snap_df[["video_id", "view_count", "like_count", "comment_count"]],
-            on="video_id",
-            how="left",
-        )
-
-        # Nếu thiếu cột (trường hợp DB lạ), tạo fallback 0
+        merged = base.merge(snap_df[["video_id", "view_count", "like_count", "comment_count"]], on="video_id", how="left")
         merged = ensure_df_columns(merged, {"view_count": 0, "like_count": 0, "comment_count": 0})
         merged = coerce_int(merged, ["view_count", "like_count", "comment_count"])
         videos_df = merged
@@ -711,7 +714,7 @@ def main():
         c3.metric("Tổng subscribers", fmt_num(int(ch_df["subscribers"].sum()) if not ch_df.empty else 0))
         st.divider()
 
-        f1, f2, f3 = st.columns([0.45, 0.25, 0.30])
+        f1, f2, f3 = st.columns([0.5, 0.22, 0.28])
         q = f1.text_input("Tìm theo tiêu đề", value="", placeholder="Search…", key="search_title")
         sort_mode = f2.selectbox("Sắp xếp", ["Mới nhất", "Nhiều view"], index=0, key="sort_mode")
         show_n = f3.selectbox("Hiển thị", [24, 48, 72, 120], index=1, key="show_n")
@@ -727,7 +730,7 @@ def main():
             df_show = df_show.sort_values("_dt", ascending=False).drop(columns=["_dt"], errors="ignore")
 
         df_show = df_show.head(int(show_n))
-        render_video_grid(df_show, ch_df, rpm_long=rpm_long, rpm_shorts=rpm_shorts, viral_rel_threshold=viral_rel_threshold)
+        render_video_cards(df_show, ch_df, rpm_long=rpm_long, rpm_shorts=rpm_shorts, viral_rel_threshold=viral_rel_threshold, columns=4)
 
     with tab2:
         st.caption("Lọc video trong N ngày qua có **Views ≥ 3× Subscribers**.")
@@ -754,9 +757,9 @@ def main():
             df_out = df_out.sort_values(["ratio", "view_count"], ascending=[False, False])
             df_out["channel_title"] = df_out["channel_id"].astype(str).map(name_map).fillna(df_out["channel_id"].astype(str))
 
-            show = df_out.rename(
-                columns={"channel_title": "Kênh", "title": "Video", "view_count": "Views", "subs": "Subscribers", "ratio": "Views/Subs"}
-            )[["Kênh", "Video", "Views", "Subscribers", "Views/Subs"]]
+            show = df_out.rename(columns={"channel_title": "Kênh", "title": "Video", "view_count": "Views", "subs": "Subscribers", "ratio": "Views/Subs"})[
+                ["Kênh", "Video", "Views", "Subscribers", "Views/Subs"]
+            ]
             show["Link"] = (YOUTUBE_WATCH + df_out["video_id"].astype(str)).values
             st.dataframe(show, use_container_width=True, height=520)
 
