@@ -685,6 +685,24 @@ def render_video_grid(videos: pd.DataFrame, channels: pd.DataFrame, rpm_long: fl
     parts.append("</div>")
     st.markdown("\n".join(parts), unsafe_allow_html=True)
 
+/* FORCE SIDEBAR ALWAYS VISIBLE (Streamlit Cloud hay bị kẹt) */
+section[data-testid="stSidebar"]{
+  transform: none !important;
+  margin-left: 0 !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+  display: block !important;
+}
+
+/* Nếu Streamlit đang ở trạng thái collapsed */
+section[data-testid="stSidebar"][aria-expanded="false"]{
+  transform: none !important;
+}
+
+/* Ẩn nút collapse mặc định để người dùng khỏi ấn nhầm */
+div[data-testid="collapsedControl"]{
+  display: none !important;
+}
 
 # -------------------------
 # Main
