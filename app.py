@@ -448,18 +448,20 @@ def inject_css():
           }
 
           .tw-grid{
-            display:grid;
-            grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+            display: grid !important;
+            width: 100% !important;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
             gap: 16px;
+            align-items: start;
           }
-          .tw-card{ border-radius: 16px; }
+          .tw-card{ border-radius: 16px; min-width: 0; }
           .tw-thumb{
             position:relative; width:100%; aspect-ratio:16/9;
             border-radius: 16px; overflow:hidden;
             border:1px solid rgba(255,255,255,0.10);
             background: rgba(255,255,255,0.04);
           }
-          .tw-thumb img{ width:100%; height:100%; object-fit:cover; display:block; }
+          .tw-thumb img{ width:100%; height:100%; object-fit:cover; object-position:center; display:block; }
           .tw-badge{
             position:absolute; left:10px; top:10px;
             padding: 3px 8px; border-radius: 999px;
@@ -512,7 +514,7 @@ def render_video_grid(
             name = safe_str(r["title"]).strip() or safe_str(r["handle"]).strip() or cid or "(unknown)"
             ch_map[cid] = {"name": name, "subs": int(r["subscribers"])}
 
-    parts = ["<div class=\"tw-grid\">\n"]
+    parts = ["<div class=\"tw-grid\" style=\"width:100%\">\n"]
     for _, r in videos.iterrows():
         vid = safe_str(r["video_id"]).strip()
         cid = safe_str(r["channel_id"]).strip()
