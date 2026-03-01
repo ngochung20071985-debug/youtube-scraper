@@ -557,30 +557,76 @@ def render_video_cards(
 
             badge = "<div class='tw-badge'>✅🔥 VIRAL</div>" if viral else ""
 
-            html = textwrap.dedent(
-                f"""\
-<a class="tw-open" href="{url}" target="_blank" rel="noopener">
-  <div class="tw-card">
-    <div class="tw-thumb">
-      <img src="{thumb}" />
-      {badge}
-    </div>
-    <div class="tw-meta">
-      <div class="tw-title">{title}</div>
-      <div class="tw-sub">{ch_name} • {fmt_num(views)} lượt xem • {ago}</div>
-      <div class="tw-badges">
-        <span class="tw-chip">👁️ <b>{fmt_num(views)}</b></span>
-        <span class="tw-chip">👍 <b>{fmt_num(likes)}</b></span>
-        <span class="tw-chip">💬 <b>{fmt_num(comments)}</b></span>
-        <span class="tw-chip">⚡ <b>{fmt_num(int(vph))}</b>/giờ</span>
-        <span class="tw-chip">💡 <b>{eng:.1f}%</b></span>
-        <span class="tw-chip">💵 <b>≈${rev:,.2f}</b></span>
-      </div>
-    </div>
-  </div>
-</a>
-"""
-            )
+            # Render HTML không bị Markdown biến thành code-block (tránh indent 4 spaces)
+
+
+            lines = [
+
+
+                f'<a class="tw-open" href="{url}" target="_blank" rel="noopener">',
+
+
+                '<div class="tw-card">',
+
+
+                '<div class="tw-thumb">',
+
+
+                f'<img src="{thumb}" />',
+
+
+                f"{badge}",
+
+
+                '</div>',
+
+
+                '<div class="tw-meta">',
+
+
+                f'<div class="tw-title">{title}</div>',
+
+
+                f'<div class="tw-sub">{ch_name} • {fmt_num(views)} lượt xem • {ago}</div>',
+
+
+                '<div class="tw-badges">',
+
+
+                f'<span class="tw-chip">👁️ <b>{fmt_num(views)}</b></span>',
+
+
+                f'<span class="tw-chip">👍 <b>{fmt_num(likes)}</b></span>',
+
+
+                f'<span class="tw-chip">💬 <b>{fmt_num(comments)}</b></span>',
+
+
+                f'<span class="tw-chip">⚡ <b>{fmt_num(int(vph))}</b>/giờ</span>',
+
+
+                f'<span class="tw-chip">💡 <b>{eng:.1f}%</b></span>',
+
+
+                f'<span class="tw-chip">💵 <b>≈${rev:,.2f}</b></span>',
+
+
+                '</div>',
+
+
+                '</div>',
+
+
+                '</div>',
+
+
+                '</a>',
+
+
+            ]
+
+
+            html = "\n".join([ln for ln in lines if ln and ln != "None"])
             st.markdown(html, unsafe_allow_html=True)
 
 
