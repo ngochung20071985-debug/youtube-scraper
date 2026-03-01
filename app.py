@@ -659,8 +659,8 @@ def main():
     st.sidebar.divider()
     st.sidebar.subheader("💵 RPM (ước tính)")
     auto_rpm = st.sidebar.toggle("Tự động gợi ý RPM", value=True, key="auto_rpm_toggle")
-    rpm_long = st.sidebar.slider("RPM Long ($/1000 views)", 0.1, 30.0, 1.5, 0.1, key="rpm_long_val")
-    rpm_shorts = st.sidebar.slider("RPM Shorts ($/1000 views)", 0.01, 5.0, 0.2, 0.01, key="rpm_shorts_val")
+    rpm_long = st.sidebar.slider("RPM Long ($/1000 views)", 0.1, 30.0, float(st.session_state.get("rpm_long_val", 1.5)), 0.1, key="rpm_long_val")
+    rpm_shorts = st.sidebar.slider("RPM Shorts ($/1000 views)", 0.01, 5.0, float(st.session_state.get("rpm_shorts_val", 0.2)), 0.01, key="rpm_shorts_val")
     viral_rel_threshold = st.sidebar.slider("Ngưỡng viral (Views/Subs ≥)", 1.0, 20.0, 3.0, 0.5, key="viral_threshold")
 
     # Load data
@@ -669,22 +669,33 @@ def main():
         videos_df = pd.DataFrame(columns=["video_id", "channel_id", "published_at", "title", "description", "tags_json", "niche", "sentiment"])
     videos_df = ensure_df_columns(videos_df, {"video_id": "", "channel_id": "", "published_at": "", "title": "", "description": "", "tags_json": "", "niche": "", "sentiment": ""})
 
-    videos_df["view_count"] = 0
-    videos_df["like_count"] = 0
-    videos_df["comment_count"] = 0
+    # Gắn metrics mới nhất từ snapshots vào videos (view/like/comment)
     vid_ids = [str(x) for x in videos_df["video_id"].astype(str).tolist() if str(x).strip()]
     snap_df = fetch_latest_video_snapshots(vid_ids) if vid_ids else pd.DataFrame()
+
+    # Luôn đảm bảo có 3 cột metrics để UI không crash
+    videos_df = ensure_df_columns(videos_df, {"view_count": 0, "like_count": 0, "comment_count": 0})
 
     if not snap_df.empty:
         snap_df = ensure_df_columns(snap_df, {"video_id": "", "view_count": 0, "like_count": 0, "comment_count": 0})
         snap_df = coerce_int(snap_df, ["view_count", "like_count", "comment_count"])
-        videos_df["video_id"] = videos_df["video_id"].astype(str)
+
+        base = videos_df.drop(columns=["view_count", "like_count", "comment_count"], errors="ignore").copy()
+        base["video_id"] = base["video_id"].astype(str)
         snap_df["video_id"] = snap_df["video_id"].astype(str)
-        merged = videos_df.merge(snap_df[["video_id", "view_count", "like_count", "comment_count"]], on="video_id", how="left")
-        for c in ["view_count", "like_count", "comment_count"]:
-            merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0).astype(int)
+
+        merged = base.merge(
+            snap_df[["video_id", "view_count", "like_count", "comment_count"]],
+            on="video_id",
+            how="left",
+        )
+
+        # Nếu thiếu cột (trường hợp DB lạ), tạo fallback 0
+        merged = ensure_df_columns(merged, {"view_count": 0, "like_count": 0, "comment_count": 0})
+        merged = coerce_int(merged, ["view_count", "like_count", "comment_count"])
         videos_df = merged
-    videos_df = coerce_int(videos_df, ["view_count", "like_count", "comment_count"])
+    else:
+        videos_df = coerce_int(videos_df, ["view_count", "like_count", "comment_count"])
 
     if auto_rpm:
         sug = auto_rpm_estimate(videos_df)
