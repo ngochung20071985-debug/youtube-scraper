@@ -16,6 +16,7 @@ toolwatch (Streamlit Frontend-only) — Supabase
 from __future__ import annotations
 
 import re
+import textwrap
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -511,7 +512,7 @@ def render_video_grid(
             name = safe_str(r["title"]).strip() or safe_str(r["handle"]).strip() or cid or "(unknown)"
             ch_map[cid] = {"name": name, "subs": int(r["subscribers"])}
 
-    parts = ["<div class='tw-grid'>"]
+    parts = ["<div class=\"tw-grid\">\n"]
     for _, r in videos.iterrows():
         vid = safe_str(r["video_id"]).strip()
         cid = safe_str(r["channel_id"]).strip()
@@ -537,30 +538,28 @@ def render_video_grid(
 
         badge = "<div class='tw-badge'>✅🔥 VIRAL</div>" if viral else ""
 
-        parts.append(
-            f"""
-            <div class="tw-card">
-              <a class="tw-open" href="{url}" target="_blank" rel="noopener">
-                <div class="tw-thumb">
-                  <img src="{thumb}" />
-                  {badge}
-                </div>
-                <div class="tw-meta">
-                  <div class="tw-title">{title}</div>
-                  <div class="tw-sub">{ch_name} • {fmt_num(views)} lượt xem • {ago}</div>
-                  <div class="tw-metrics">
-                    <span>👁️ <b>{views:,}</b></span>
-                    <span>👍 <b>{likes:,}</b></span>
-                    <span>💬 <b>{comments:,}</b></span>
-                    <span>💵 <b>≈${rev:,.2f}</b></span>
-                  </div>
-                </div>
-              </a>
-            </div>
-            """
-        )
+        parts.append(textwrap.dedent(f"""\
+<div class="tw-card">
+  <a class="tw-open" href="{url}" target="_blank" rel="noopener">
+    <div class="tw-thumb">
+      <img src="{thumb}" />
+      {badge}
+    </div>
+    <div class="tw-meta">
+      <div class="tw-title">{title}</div>
+      <div class="tw-sub">{ch_name} • {fmt_num(views)} lượt xem • {ago}</div>
+      <div class="tw-metrics">
+        <span>👁️ <b>{views:,}</b></span>
+        <span>👍 <b>{likes:,}</b></span>
+        <span>💬 <b>{comments:,}</b></span>
+        <span>💵 <b>≈${rev:,.2f}</b></span>
+      </div>
+    </div>
+  </a>
+</div>
+"""))
 
-    parts.append("</div>")
+    parts.append("\n</div>")
     st.markdown("\n".join(parts), unsafe_allow_html=True)
 
 
