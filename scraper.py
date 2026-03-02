@@ -1,37 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-scraper.py — Background worker quét YouTube API v3 và ghi vào Supabase (PostgreSQL)
+scraper.py — YouTube -> Supabase worker (Async) + Auto-Discover + AI RPM (Gemini)
 
-✅ Async + aiohttp
-✅ Ghi dữ liệu vào: channels, videos, snapshots (+ scraper_state nếu có)
+✅ Không dùng SQLite
+✅ Ghi 3 bảng: channels, videos, snapshots (+ scraper_state nếu có)
+✅ Auto-Discover kênh mới mỗi ngày (random 1–2 keyword) ở ĐẦU main()
+✅ AI (Gemini) trả về JSON thuần: niche/sentiment/country_target/estimated_rpm
+✅ videos UPSERT có đủ: niche, sentiment, country_target, estimated_rpm
+✅ Dedupe payload trước khi upsert (tránh lỗi ON CONFLICT DO UPDATE ... a second time)
 
-ENV bắt buộc (GitHub Actions Secrets):
+ENV bắt buộc:
 - SUPABASE_URL
 - SUPABASE_SERVICE_ROLE_KEY
 
 ENV YouTube:
-- YOUTUBE_API_KEYS="key1,key2,key3"   (ưu tiên)
+- YOUTUBE_API_KEYS="key1,key2,key3"   (khuyến nghị)
   hoặc YOUTUBE_API_KEY="key1"         (fallback)
 
-⚠️ Lưu ý quan trọng về QUOTA:
-- Quota của YouTube Data API gắn với *Google Cloud Project*.
-- Việc “xoay key để vượt quota” thường KHÔNG giải quyết được nếu các key nằm trong cùng project,
-  và có thể vi phạm ToS tùy cách bạn triển khai.
-- File này chỉ hỗ trợ:
-  ✅ fallback sang key khác khi key *không hợp lệ / bị tắt dịch vụ* (keyInvalid / accessNotConfigured)
-  ❌ KHÔNG tự xoay key để “vượt quota” khi gặp quotaExceeded.
-  -> Khi gặp quotaExceeded, scraper sẽ dừng an toàn và in log cảnh báo.
+ENV AI (tuỳ chọn):
+- GEMINI_API_KEY=...
 
-ENV tuỳ chọn:
+Tuỳ chọn:
 - CONCURRENCY=10
 - MAX_VIDEOS_PER_CHANNEL=50
-- MAX_CHANNELS_PER_RUN=0          (0 = không giới hạn)
-- DRY_RUN=0                       (1 = chỉ in log, không ghi DB)
-- DISCOVER_KEYWORDS="a,b,c"        (auto discover channels mỗi ngày 1 lần, cuối run)
-- DISCOVER_MIN_SUBS=1000
-- DISCOVER_MAX_SUBS=50000
-- GEMINI_API_KEY=...               (nếu muốn AI classify niche/sentiment)
+- MAX_CHANNELS_PER_RUN=0            (0 = tất cả)
+- AI_MAX_PER_RUN=30                 (giới hạn số video gọi AI mỗi lần chạy)
+- DRY_RUN=0                         (1 = không ghi DB)
 """
 
 from __future__ import annotations
@@ -39,20 +34,28 @@ from __future__ import annotations
 import os
 import json
 import re
+import random
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta, date
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import aiohttp
 from supabase import create_client, Client
 
+
+# =============================
+# 1) Auto-Discover keywords (bạn tự sửa list này)
+# =============================
+TARGET_KEYWORDS = ["kiếm tiền online", "tóm tắt phim", "AI tools", "kể chuyện ma", "review công nghệ"]
+
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
-# -----------------------------
+
+# =============================
 # Helpers
-# -----------------------------
+# =============================
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -61,48 +64,212 @@ def safe_str(x: Any) -> str:
 
 def to_int(x: Any) -> int:
     try:
-        return int(x)
+        return int(float(x))
     except Exception:
         return 0
 
-def _env_optional(name: str, default: Optional[str] = None) -> Optional[str]:
+def to_float(x: Any) -> Optional[float]:
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def env_optional(name: str, default: Optional[str] = None) -> Optional[str]:
     v = os.getenv(name, default)
     if v is None:
         return None
     v = str(v).strip()
     return v if v else None
 
-def _env_required(name: str) -> str:
-    v = _env_optional(name)
+def env_required(name: str) -> str:
+    v = env_optional(name)
     if not v:
         raise RuntimeError(f"Thiếu biến môi trường: {name}")
     return v
 
-def _env_int(name: str, default: int) -> int:
-    v = _env_optional(name)
+def env_int(name: str, default: int) -> int:
+    v = env_optional(name)
     if not v:
-        return int(default)
+        return default
     try:
         return int(v)
     except Exception:
-        return int(default)
+        return default
 
 def chunked(xs: List[Any], n: int) -> List[List[Any]]:
     return [xs[i:i+n] for i in range(0, len(xs), n)]
 
 def dedupe_rows(rows: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
-    """Tránh lỗi Postgres: 'ON CONFLICT DO UPDATE command cannot affect row a second time'."""
-    out: Dict[str, Dict[str, Any]] = {}
+    """Tránh lỗi Postgres: ON CONFLICT DO UPDATE cannot affect row a second time."""
+    seen: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         k = safe_str(r.get(key)).strip()
         if not k:
             continue
-        out[k] = r
-    return list(out.values())
+        seen[k] = r
+    return list(seen.values())
 
-# -----------------------------
-# API Key pool (fallback only)
-# -----------------------------
+
+# =============================
+# Config
+# =============================
+@dataclass
+class Cfg:
+    supabase_url: str
+    supabase_key: str
+    youtube_keys: List[str]
+    concurrency: int = 10
+    max_videos_per_channel: int = 50
+    max_channels_per_run: int = 0
+    dry_run: bool = False
+    gemini_api_key: Optional[str] = None
+    ai_max_per_run: int = 30
+
+def load_cfg() -> Cfg:
+    ykeys = env_optional("YOUTUBE_API_KEYS")
+    if ykeys:
+        keys = [k.strip() for k in ykeys.split(",") if k.strip()]
+    else:
+        k1 = env_optional("YOUTUBE_API_KEY")
+        keys = [k1] if k1 else []
+
+    return Cfg(
+        supabase_url=env_required("SUPABASE_URL"),
+        supabase_key=env_required("SUPABASE_SERVICE_ROLE_KEY"),
+        youtube_keys=keys,
+        concurrency=env_int("CONCURRENCY", 10),
+        max_videos_per_channel=env_int("MAX_VIDEOS_PER_CHANNEL", 50),
+        max_channels_per_run=env_int("MAX_CHANNELS_PER_RUN", 0),
+        dry_run=(env_optional("DRY_RUN", "0") == "1"),
+        gemini_api_key=env_optional("GEMINI_API_KEY"),
+        ai_max_per_run=env_int("AI_MAX_PER_RUN", 30),
+    )
+
+
+# =============================
+# Supabase
+# =============================
+def supa(cfg: Cfg) -> Client:
+    return create_client(cfg.supabase_url, cfg.supabase_key)
+
+def _supa_safe_upsert_scraper_state(client: Client, payload: Dict[str, Any]) -> None:
+    """
+    scraper_state schema có thể khác nhau giữa các project.
+    -> Upsert thử đầy đủ, nếu lỗi cột không tồn tại -> retry với payload tối thiểu.
+    """
+    payload = dict(payload)
+    payload.setdefault("id", 1)
+    try:
+        client.table("scraper_state").upsert(payload, on_conflict="id").execute()
+        return
+    except Exception as e:
+        msg = safe_str(e)
+        if "does not exist" in msg or "column" in msg:
+            minimal = {k: payload[k] for k in payload.keys() if k in ("id", "status", "message", "updated_at", "pct", "progress", "last_run_at")}
+            try:
+                client.table("scraper_state").upsert(minimal, on_conflict="id").execute()
+            except Exception:
+                pass
+        else:
+            # ignore hard (don't crash)
+            pass
+
+def get_scraper_state(client: Client) -> Dict[str, Any]:
+    try:
+        r = client.table("scraper_state").select("*").order("updated_at", desc=True).limit(1).execute()
+        row = (r.data or [None])[0] or {}
+        return dict(row)
+    except Exception:
+        return {}
+
+def fetch_all_channel_ids(client: Client) -> Set[str]:
+    out: Set[str] = set()
+    # paginate with range (1k/page)
+    start = 0
+    page = 1000
+    while True:
+        q = client.table("channels").select("channel_id").range(start, start + page - 1)
+        r = q.execute()
+        data = r.data or []
+        for row in data:
+            cid = safe_str(row.get("channel_id")).strip()
+            if cid:
+                out.add(cid)
+        if len(data) < page:
+            break
+        start += page
+        if start > 200000:  # safety
+            break
+    return out
+
+def list_channels_to_scan(client: Client, limit: int = 0) -> List[str]:
+    q = client.table("channels").select("channel_id").order("created_at", desc=False)
+    if limit and limit > 0:
+        q = q.limit(limit)
+        r = q.execute()
+        return [safe_str(x.get("channel_id")).strip() for x in (r.data or []) if safe_str(x.get("channel_id")).strip()]
+
+    # paginate
+    out: List[str] = []
+    start = 0
+    page = 1000
+    while True:
+        r = client.table("channels").select("channel_id").order("created_at", desc=False).range(start, start + page - 1).execute()
+        data = r.data or []
+        out.extend([safe_str(x.get("channel_id")).strip() for x in data if safe_str(x.get("channel_id")).strip()])
+        if len(data) < page:
+            break
+        start += page
+        if start > 200000:
+            break
+    return out
+
+def upsert_channels(client: Client, rows: List[Dict[str, Any]], dry_run: bool) -> None:
+    rows = dedupe_rows(rows, "channel_id")
+    if not rows:
+        return
+    if dry_run:
+        print(f"[DRY_RUN] upsert channels: {len(rows)}")
+        return
+    client.table("channels").upsert(rows, on_conflict="channel_id").execute()
+
+def upsert_videos(client: Client, rows: List[Dict[str, Any]], dry_run: bool) -> None:
+    rows = dedupe_rows(rows, "video_id")
+    if not rows:
+        return
+    if dry_run:
+        print(f"[DRY_RUN] upsert videos: {len(rows)}")
+        return
+    # chunk to avoid payload too large
+    for ch in chunked(rows, 250):
+        client.table("videos").upsert(ch, on_conflict="video_id").execute()
+
+def insert_snapshots(client: Client, rows: List[Dict[str, Any]], dry_run: bool) -> None:
+    if not rows:
+        return
+    if dry_run:
+        print(f"[DRY_RUN] insert snapshots: {len(rows)}")
+        return
+    for ch in chunked(rows, 500):
+        client.table("snapshots").insert(ch).execute()
+
+def fetch_existing_video_ai_fields(client: Client, video_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Map video_id -> existing niche/sentiment/country_target/estimated_rpm (để khỏi gọi AI lại)."""
+    mp: Dict[str, Dict[str, Any]] = {}
+    if not video_ids:
+        return mp
+    for ch in chunked(video_ids, 200):
+        r = client.table("videos").select("video_id,niche,sentiment,country_target,estimated_rpm").in_("video_id", ch).execute()
+        for row in (r.data or []):
+            vid = safe_str(row.get("video_id")).strip()
+            if vid:
+                mp[vid] = row
+    return mp
+
+
+# =============================
+# YouTube API — key pool
+# =============================
 class QuotaExceeded(RuntimeError):
     pass
 
@@ -127,58 +294,7 @@ class ApiKeyPool:
     async def size(self) -> int:
         return len(self._keys)
 
-# -----------------------------
-# Config
-# -----------------------------
-@dataclass
-class Cfg:
-    supabase_url: str
-    supabase_key: str
-    youtube_keys: List[str]
-    concurrency: int = 10
-    max_videos_per_channel: int = 50
-    max_channels_per_run: int = 0
-    dry_run: bool = False
-    discover_keywords: List[str] = None
-    discover_min_subs: int = 1000
-    discover_max_subs: int = 50000
-    gemini_api_key: Optional[str] = None
-
-def load_cfg() -> Cfg:
-    ykeys = _env_optional("YOUTUBE_API_KEYS")
-    if ykeys:
-        keys = [k.strip() for k in ykeys.split(",") if k.strip()]
-    else:
-        k1 = _env_optional("YOUTUBE_API_KEY")
-        keys = [k1] if k1 else []
-
-    kw = _env_optional("DISCOVER_KEYWORDS")
-    discover_keywords = [x.strip() for x in kw.split(",") if x.strip()] if kw else []
-
-    return Cfg(
-        supabase_url=_env_required("SUPABASE_URL"),
-        supabase_key=_env_required("SUPABASE_SERVICE_ROLE_KEY"),
-        youtube_keys=keys,
-        concurrency=_env_int("CONCURRENCY", 10),
-        max_videos_per_channel=_env_int("MAX_VIDEOS_PER_CHANNEL", 50),
-        max_channels_per_run=_env_int("MAX_CHANNELS_PER_RUN", 0),
-        dry_run=(_env_optional("DRY_RUN", "0") == "1"),
-        discover_keywords=discover_keywords,
-        discover_min_subs=_env_int("DISCOVER_MIN_SUBS", 1000),
-        discover_max_subs=_env_int("DISCOVER_MAX_SUBS", 50000),
-        gemini_api_key=_env_optional("GEMINI_API_KEY"),
-    )
-
-def supa(cfg: Cfg) -> Client:
-    return create_client(cfg.supabase_url, cfg.supabase_key)
-
-# -----------------------------
-# YouTube fetch with fallback (NOT quota bypass)
-# -----------------------------
 def _parse_yt_error(text: str) -> Tuple[str, str]:
-    """
-    Return (reason, message)
-    """
     try:
         j = json.loads(text)
         err = j.get("error") or {}
@@ -196,12 +312,11 @@ async def fetch_json_youtube(
     params: Dict[str, Any],
     *,
     retries: int = 2,
-    backoff: float = 1.4,
+    backoff: float = 1.5,
 ) -> Dict[str, Any]:
     """
-    - Inject key from ApiKeyPool.
-    - Nếu keyInvalid / accessNotConfigured -> rotate và retry.
-    - Nếu quotaExceeded -> raise QuotaExceeded (STOP).
+    Rotate key only for keyInvalid/accessNotConfigured.
+    If quotaExceeded -> raise QuotaExceeded (stop safely).
     """
     last_err: Optional[Exception] = None
 
@@ -211,26 +326,20 @@ async def fetch_json_youtube(
         p["key"] = api_key
 
         try:
-            async with session.get(
-                endpoint,
-                params=p,
-                timeout=aiohttp.ClientTimeout(total=35),
-            ) as resp:
+            async with session.get(endpoint, params=p, timeout=aiohttp.ClientTimeout(total=35)) as resp:
                 txt = await resp.text()
                 if resp.status < 400:
                     return await resp.json()
 
                 reason, msg = _parse_yt_error(txt)
 
-                # Quota => STOP (không xoay để "vượt quota")
                 if resp.status == 403 and reason in ("quotaExceeded", "dailyLimitExceeded", "userRateLimitExceeded"):
-                    raise QuotaExceeded(f"Quota exceeded: reason={reason} msg={msg}")
+                    raise QuotaExceeded(f"YouTube quota exceeded: {reason} — {msg}")
 
-                # Key invalid / service not enabled => rotate
-                if resp.status in (400, 403) and reason in ("keyInvalid", "accessNotConfigured", "forbidden"):
+                if resp.status in (400, 403) and reason in ("keyInvalid", "accessNotConfigured"):
                     if await pool.size() > 1:
                         nxt = await pool.rotate()
-                        print(f"[WARN] Key lỗi ({reason}). Đổi sang key tiếp theo. now={nxt[:6]}…")
+                        print(f"[WARN] Key lỗi ({reason}). Đổi key -> {nxt[:6]}…")
                         await asyncio.sleep(0.2)
                         continue
 
@@ -242,33 +351,25 @@ async def fetch_json_youtube(
             last_err = e
             await asyncio.sleep(backoff ** attempt)
 
-    raise RuntimeError(f"Request failed after retries: {endpoint} params={list(params.keys())}") from last_err
+    raise RuntimeError(f"Request failed after retries: {endpoint}") from last_err
 
-# -----------------------------
-# YouTube API wrappers
-# -----------------------------
-async def yt_channels(session: aiohttp.ClientSession, pool: ApiKeyPool, channel_id: str) -> Optional[Dict[str, Any]]:
-    url = f"{YOUTUBE_API_BASE}/channels"
-    params = {
-        "part": "snippet,statistics,contentDetails",
-        "id": channel_id,
-        "maxResults": 1,
-    }
+
+# =============================
+# YouTube wrappers
+# =============================
+async def yt_search_channels(session: aiohttp.ClientSession, pool: ApiKeyPool, keyword: str) -> List[Dict[str, Any]]:
+    url = f"{YOUTUBE_API_BASE}/search"
+    params = {"part": "snippet", "q": keyword, "type": "channel", "maxResults": 50, "order": "relevance"}
     data = await fetch_json_youtube(session, pool, url, params)
-    items = data.get("items") or []
-    return items[0] if items else None
+    return data.get("items") or []
 
-async def yt_videos(session: aiohttp.ClientSession, pool: ApiKeyPool, video_ids: List[str]) -> List[Dict[str, Any]]:
-    if not video_ids:
+async def yt_channels_by_ids(session: aiohttp.ClientSession, pool: ApiKeyPool, ids: List[str]) -> List[Dict[str, Any]]:
+    if not ids:
         return []
-    url = f"{YOUTUBE_API_BASE}/videos"
+    url = f"{YOUTUBE_API_BASE}/channels"
     items: List[Dict[str, Any]] = []
-    for chunk in chunked(video_ids, 50):
-        params = {
-            "part": "snippet,statistics,contentDetails",
-            "id": ",".join(chunk),
-            "maxResults": 50,
-        }
+    for ch in chunked(ids, 50):
+        params = {"part": "snippet,statistics,contentDetails", "id": ",".join(ch), "maxResults": 50}
         data = await fetch_json_youtube(session, pool, url, params)
         items.extend(data.get("items") or [])
     return items
@@ -280,69 +381,170 @@ async def yt_playlist_items_video_ids(
     *,
     limit: int,
 ) -> List[str]:
-    """Lấy video_ids từ uploads playlist (rẻ quota hơn search.list)."""
     url = f"{YOUTUBE_API_BASE}/playlistItems"
     video_ids: List[str] = []
     page_token: Optional[str] = None
+
     while len(video_ids) < limit:
-        params = {
+        params: Dict[str, Any] = {
             "part": "contentDetails",
             "playlistId": uploads_playlist_id,
             "maxResults": min(50, limit - len(video_ids)),
         }
         if page_token:
             params["pageToken"] = page_token
+
         data = await fetch_json_youtube(session, pool, url, params)
         for it in data.get("items") or []:
             cd = it.get("contentDetails") or {}
             vid = cd.get("videoId")
             if vid:
                 video_ids.append(vid)
+
         page_token = data.get("nextPageToken")
         if not page_token:
             break
+
     return video_ids
 
-async def yt_search_channels_by_keyword(session: aiohttp.ClientSession, pool: ApiKeyPool, keyword: str, max_results: int = 25) -> List[str]:
-    """Auto-discover: tìm channelId theo keyword (type=channel)."""
-    url = f"{YOUTUBE_API_BASE}/search"
-    params = {
-        "part": "snippet",
-        "q": keyword,
-        "type": "channel",
-        "maxResults": min(50, max_results),
-        "order": "relevance",
-    }
-    data = await fetch_json_youtube(session, pool, url, params)
-    out: List[str] = []
-    for it in data.get("items") or []:
-        cid = (((it.get("id") or {}).get("channelId")) or "")
-        if cid:
-            out.append(str(cid))
-    return out
+async def yt_videos_by_ids(session: aiohttp.ClientSession, pool: ApiKeyPool, ids: List[str]) -> List[Dict[str, Any]]:
+    if not ids:
+        return []
+    url = f"{YOUTUBE_API_BASE}/videos"
+    items: List[Dict[str, Any]] = []
+    for ch in chunked(ids, 50):
+        params = {"part": "snippet,statistics,contentDetails", "id": ",".join(ch), "maxResults": 50}
+        data = await fetch_json_youtube(session, pool, url, params)
+        items.extend(data.get("items") or [])
+    return items
 
-# -----------------------------
-# Gemini AI (optional)
-# -----------------------------
-async def analyze_video_with_ai(session: aiohttp.ClientSession, gemini_key: str, title: str, description: str) -> Tuple[str, str]:
+
+# =============================
+# 2) Auto-Discover (run first in main)
+# =============================
+def _should_run_discover_daily(state: Dict[str, Any]) -> bool:
+    """Chỉ chạy 1 lần / 24h để bảo vệ quota."""
+    last = state.get("last_discover_at")
+    if not last:
+        return True
+    try:
+        dt = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+        return (utc_now() - dt) >= timedelta(hours=24)
+    except Exception:
+        return True
+
+async def auto_discover_new_channels(
+    session: aiohttp.ClientSession,
+    pool: ApiKeyPool,
+    client: Client,
+) -> int:
     """
-    Return (niche, sentiment). Nếu lỗi -> ("","")
+    - Random 1–2 keyword từ TARGET_KEYWORDS
+    - search.list type=channel maxResults=50
+    - Lấy channel_id/title/avatar_url
+    - Nếu chưa có -> UPSERT vào channels
+    - Enrich thêm subscribers/title/avatar bằng channels.list (rẻ quota)
+    """
+    if not TARGET_KEYWORDS:
+        return 0
+
+    existing = fetch_all_channel_ids(client)
+
+    k = 1 if len(TARGET_KEYWORDS) == 1 else random.choice([1, 2])
+    picked = random.sample(TARGET_KEYWORDS, k=k)
+    print(f"[INFO] discover keywords: {picked}")
+
+    found_ids: List[str] = []
+
+    for kw in picked:
+        items = await yt_search_channels(session, pool, kw)
+        for it in items:
+            cid = safe_str(((it.get("id") or {}).get("channelId"))).strip()
+            if not cid or cid in existing:
+                continue
+            found_ids.append(cid)
+            existing.add(cid)
+
+    found_ids = list(dict.fromkeys(found_ids))
+    if not found_ids:
+        print("[INFO] discover: no new channels")
+        return 0
+
+    # Enrich using channels.list
+    ch_items = await yt_channels_by_ids(session, pool, found_ids[:50])
+    rows: List[Dict[str, Any]] = []
+    for it in ch_items:
+        cid = safe_str(it.get("id")).strip()
+        if not cid:
+            continue
+        sn = it.get("snippet") or {}
+        stt = it.get("statistics") or {}
+        thumbs = sn.get("thumbnails") or {}
+        avatar = safe_str((thumbs.get("high") or thumbs.get("default") or {}).get("url")).strip()
+
+        rows.append({
+            "channel_id": cid,
+            "title": safe_str(sn.get("title")).strip(),
+            "handle": safe_str(sn.get("customUrl")).strip(),
+            "avatar_url": avatar,
+            "subscribers": to_int(stt.get("subscriberCount")),
+        })
+
+    rows = dedupe_rows(rows, "channel_id")
+    if rows:
+        upsert_channels(client, rows, dry_run=False)
+        print(f"[INFO] discover: inserted/upserted {len(rows)} channels")
+        return len(rows)
+
+    return 0
+
+
+# =============================
+# 3) Gemini AI — strict JSON
+# =============================
+ALLOWED_NICHE = ["Tài chính", "Công nghệ", "Giáo dục", "Giải trí", "Gaming", "Tin tức", "Đời sống", "Truyện/Phim", "Khác"]
+ALLOWED_SENT = ["Tích cực", "Tiêu cực", "Trung lập", "Giật gân", "Hài hước", "Bí ẩn"]
+
+def _sanitize_ai(niche: str, sentiment: str, country: str, rpm: Optional[float]) -> Tuple[str, str, str, Optional[float]]:
+    niche = niche.strip()
+    sentiment = sentiment.strip()
+    country = country.strip()
+
+    if niche not in ALLOWED_NICHE:
+        niche = "Khác"
+    if sentiment not in ALLOWED_SENT:
+        sentiment = "Trung lập"
+    if country == "":
+        country = "Unknown"
+    if rpm is not None:
+        # clamp to sane range
+        rpm = max(0.01, min(100.0, float(rpm)))
+    return niche, sentiment, country, rpm
+
+async def analyze_video_with_ai(
+    session: aiohttp.ClientSession,
+    gemini_key: str,
+    title: str,
+    description: str,
+) -> Tuple[str, str, str, Optional[float]]:
+    """
+    Return (niche, sentiment, country_target, estimated_rpm)
+    JSON strict (no markdown).
     """
     if not gemini_key:
-        return "", ""
+        return "", "", "", None
 
     prompt = f"""
-Bạn là hệ thống phân loại nội dung YouTube.
-Hãy đọc TIÊU ĐỀ và MÔ TẢ dưới đây, rồi trả về JSON DUY NHẤT theo format:
-{{"niche":"...","sentiment":"..."}}
+Bạn là hệ thống phân loại nội dung YouTube. Trả về JSON thuần túy (KHÔNG markdown, KHÔNG giải thích).
+Chỉ trả về 1 object JSON duy nhất với 4 trường:
+- niche: chọn 1 trong {ALLOWED_NICHE}
+- sentiment: chọn 1 trong {ALLOWED_SENT}
+- country_target: đoán quốc gia mục tiêu (vd: Vietnam, United States, Japan, ...)
+- estimated_rpm: số float USD (RPM trung bình) dựa vào ngách và quốc gia
 
-- niche: ngách chủ đề chính (ví dụ: Tài chính, Tâm lý học, Game, Giáo dục, Khoa học, Vlog, Drama, Tin tức, Review, ...).
-- sentiment: phong cách/cảm xúc (ví dụ: Giật gân, Hài hước, Giáo dục, Truyền cảm hứng, Điều tra, Phẫn nộ, Chill, ...).
-- Không thêm text ngoài JSON.
+Tiêu đề: {title}
 
-TIÊU ĐỀ: {title}
-
-MÔ TẢ: {description[:2000]}
+Mô tả: {description[:2500]}
 """.strip()
 
     payload = {
@@ -354,104 +556,42 @@ MÔ TẢ: {description[:2000]}
         async with session.post(
             f"{GEMINI_ENDPOINT}?key={gemini_key}",
             json=payload,
-            timeout=aiohttp.ClientTimeout(total=40),
+            timeout=aiohttp.ClientTimeout(total=45),
         ) as resp:
-            txt = await resp.text()
             if resp.status >= 400:
-                return "", ""
+                return "", "", "", None
             j = await resp.json()
-            cand = (j.get("candidates") or [{}])[0]
-            parts = (((cand.get("content") or {}).get("parts")) or [])
-            text_out = " ".join([safe_str(p.get("text")) for p in parts]).strip()
-            if not text_out:
-                return "", ""
-            # Extract JSON
-            m = re.search(r"\{.*\}", text_out, re.S)
-            if not m:
-                return "", ""
-            obj = json.loads(m.group(0))
-            niche = safe_str(obj.get("niche")).strip()
-            sentiment = safe_str(obj.get("sentiment")).strip()
-            return niche[:64], sentiment[:64]
+
+        cand = (j.get("candidates") or [{}])[0]
+        parts = (((cand.get("content") or {}).get("parts")) or [])
+        text_out = " ".join([safe_str(p.get("text")) for p in parts]).strip()
+        if not text_out:
+            return "", "", "", None
+
+        # remove ```json fences if any
+        text_out = re.sub(r"^```(?:json)?\s*", "", text_out.strip(), flags=re.I)
+        text_out = re.sub(r"\s*```$", "", text_out.strip())
+
+        m = re.search(r"\{.*\}", text_out, re.S)
+        if not m:
+            return "", "", "", None
+        obj = json.loads(m.group(0))
+
+        niche = safe_str(obj.get("niche"))
+        sentiment = safe_str(obj.get("sentiment"))
+        country = safe_str(obj.get("country_target"))
+        rpm = obj.get("estimated_rpm", None)
+        rpm_f = to_float(rpm)
+
+        niche, sentiment, country, rpm_f = _sanitize_ai(niche, sentiment, country, rpm_f)
+        return niche, sentiment, country, rpm_f
     except Exception:
-        return "", ""
+        return "", "", "", None
 
-# -----------------------------
-# Supabase writes (dedup safe)
-# -----------------------------
-def upsert_channels(client: Client, rows: List[Dict[str, Any]], *, dry_run: bool) -> None:
-    rows = dedupe_rows(rows, "channel_id")
-    if not rows:
-        return
-    if dry_run:
-        print(f"[DRY_RUN] upsert channels: {len(rows)}")
-        return
-    client.table("channels").upsert(rows, on_conflict="channel_id").execute()
 
-def upsert_videos(client: Client, rows: List[Dict[str, Any]], *, dry_run: bool) -> None:
-    rows = dedupe_rows(rows, "video_id")
-    if not rows:
-        return
-    if dry_run:
-        print(f"[DRY_RUN] upsert videos: {len(rows)}")
-        return
-    # chunk để tránh payload quá lớn
-    for chunk in chunked(rows, 250):
-        client.table("videos").upsert(chunk, on_conflict="video_id").execute()
-
-def insert_snapshots(client: Client, rows: List[Dict[str, Any]], *, dry_run: bool) -> None:
-    if not rows:
-        return
-    if dry_run:
-        print(f"[DRY_RUN] insert snapshots: {len(rows)}")
-        return
-    for chunk in chunked(rows, 500):
-        client.table("snapshots").insert(chunk).execute()
-
-def fetch_existing_channel_ids(client: Client) -> set:
-    s = set()
-    r = client.table("channels").select("channel_id").limit(10000).execute()
-    for row in r.data or []:
-        cid = safe_str(row.get("channel_id")).strip()
-        if cid:
-            s.add(cid)
-    return s
-
-def list_channels_to_scan(client: Client, *, limit: int = 0) -> List[str]:
-    q = client.table("channels").select("channel_id").order("created_at", desc=False)
-    if limit and limit > 0:
-        q = q.limit(int(limit))
-    r = q.execute()
-    out = []
-    for row in r.data or []:
-        cid = safe_str(row.get("channel_id")).strip()
-        if cid:
-            out.append(cid)
-    return out
-
-def get_scraper_state(client: Client) -> Dict[str, Any]:
-    try:
-        r = client.table("scraper_state").select("*").order("updated_at", desc=True).limit(1).execute()
-        row = (r.data or [None])[0] or {}
-        return dict(row)
-    except Exception:
-        return {}
-
-def upsert_scraper_state(client: Client, payload: Dict[str, Any], *, dry_run: bool) -> None:
-    if dry_run:
-        print("[DRY_RUN] scraper_state:", payload)
-        return
-    try:
-        # dùng single row id=1 nếu có, else insert
-        payload = dict(payload)
-        payload.setdefault("id", 1)
-        client.table("scraper_state").upsert(payload, on_conflict="id").execute()
-    except Exception:
-        pass
-
-# -----------------------------
-# Main scan logic
-# -----------------------------
+# =============================
+# Scan channel
+# =============================
 async def scan_one_channel(
     session: aiohttp.ClientSession,
     pool: ApiKeyPool,
@@ -459,12 +599,11 @@ async def scan_one_channel(
     channel_id: str,
     cfg: Cfg,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Return (channels_rows, videos_rows, snapshots_rows)
-    """
-    ch_item = await yt_channels(session, pool, channel_id)
-    if not ch_item:
+    # Get channel (snippet/stats/contentDetails)
+    items = await yt_channels_by_ids(session, pool, [channel_id])
+    if not items:
         return [], [], []
+    ch_item = items[0]
 
     snippet = ch_item.get("snippet") or {}
     stats = ch_item.get("statistics") or {}
@@ -476,49 +615,71 @@ async def scan_one_channel(
         "channel_id": channel_id,
         "title": safe_str(snippet.get("title")),
         "handle": safe_str(snippet.get("customUrl")),
-        "avatar_url": safe_str(((snippet.get("thumbnails") or {}).get("default") or {}).get("url")),
+        "avatar_url": safe_str(((snippet.get("thumbnails") or {}).get("high") or (snippet.get("thumbnails") or {}).get("default") or {}).get("url")),
         "subscribers": to_int(stats.get("subscriberCount")),
     }]
 
-    video_ids = []
+    video_ids: List[str] = []
     if uploads_pid:
         video_ids = await yt_playlist_items_video_ids(session, pool, uploads_pid, limit=cfg.max_videos_per_channel)
 
-    v_items = await yt_videos(session, pool, video_ids)
+    v_items = await yt_videos_by_ids(session, pool, video_ids)
+
+    now_iso = utc_now().isoformat()
 
     videos_rows: List[Dict[str, Any]] = []
     snapshots_rows: List[Dict[str, Any]] = []
-    now_iso = utc_now().isoformat()
 
-    # AI optional
-    gemini_key = cfg.gemini_api_key or ""
+    # Skip AI if already filled
+    existing_ai = fetch_existing_video_ai_fields(client, [safe_str(it.get("id")).strip() for it in v_items if safe_str(it.get("id")).strip()])
+    ai_budget = cfg.ai_max_per_run
 
     for it in v_items:
         vid = safe_str(it.get("id")).strip()
         if not vid:
             continue
+
         vs = it.get("snippet") or {}
-        vt = safe_str(vs.get("title"))
-        vd = safe_str(vs.get("description"))
+        stt = it.get("statistics") or {}
+
+        title = safe_str(vs.get("title"))
+        desc = safe_str(vs.get("description"))
         published_at = safe_str(vs.get("publishedAt"))
 
-        niche = ""
-        sentiment = ""
-        if gemini_key:
-            niche, sentiment = await analyze_video_with_ai(session, gemini_key, vt, vd)
+        # Default AI fields from DB if exists
+        niche = safe_str((existing_ai.get(vid) or {}).get("niche"))
+        sentiment = safe_str((existing_ai.get(vid) or {}).get("sentiment"))
+        country_target = safe_str((existing_ai.get(vid) or {}).get("country_target"))
+        est_rpm = (existing_ai.get(vid) or {}).get("estimated_rpm", None)
+
+        need_ai = (not niche) or (not sentiment) or (not country_target) or (est_rpm is None)
+        if need_ai and cfg.gemini_api_key and ai_budget > 0:
+            n2, s2, c2, r2 = await analyze_video_with_ai(session, cfg.gemini_api_key, title, desc)
+            if n2:
+                niche = n2
+            if s2:
+                sentiment = s2
+            if c2:
+                country_target = c2
+            if r2 is not None:
+                est_rpm = r2
+            ai_budget -= 1
 
         videos_rows.append({
             "video_id": vid,
             "channel_id": channel_id,
             "published_at": published_at,
-            "title": vt,
-            "description": vd,
+            "title": title,
+            "description": desc,
             "tags_json": json.dumps(vs.get("tags") or [], ensure_ascii=False),
+
+            # ✅ AI fields (cũ + mới)
             "niche": niche,
             "sentiment": sentiment,
+            "country_target": country_target,
+            "estimated_rpm": float(est_rpm) if est_rpm is not None else None,
         })
 
-        stt = it.get("statistics") or {}
         snapshots_rows.append({
             "video_id": vid,
             "captured_at": now_iso,
@@ -529,105 +690,80 @@ async def scan_one_channel(
 
     return channels_rows, videos_rows, snapshots_rows
 
-async def auto_discover_channels(session: aiohttp.ClientSession, pool: ApiKeyPool, client: Client, cfg: Cfg) -> int:
-    """
-    Tìm kênh mới theo keywords -> lọc sub [min,max] -> insert nếu chưa có.
-    Chạy 1 lần/ngày (được kiểm soát bằng scraper_state).
-    """
-    if not cfg.discover_keywords:
-        return 0
 
-    # Check daily gate using scraper_state
-    state = get_scraper_state(client)
-    last = safe_str(state.get("discover_last_date")).strip()
-    today = date.today().isoformat()
-    if last == today:
-        print("[INFO] auto_discover: đã chạy hôm nay, skip.")
-        return 0
-
-    existing = fetch_existing_channel_ids(client)
-    found: set = set()
-
-    # search channels
-    for kw in cfg.discover_keywords:
-        try:
-            ids = await yt_search_channels_by_keyword(session, pool, kw, max_results=25)
-            for cid in ids:
-                if cid and cid not in existing:
-                    found.add(cid)
-        except QuotaExceeded:
-            raise
-        except Exception as e:
-            print(f"[WARN] discover search fail kw={kw}: {e}")
-
-    if not found:
-        upsert_scraper_state(client, {"id": 1, "discover_last_date": today, "updated_at": utc_now().isoformat()}, dry_run=cfg.dry_run)
-        return 0
-
-    # fetch channel stats and filter subs
-    new_rows: List[Dict[str, Any]] = []
-    for chunk in chunked(list(found), 50):
-        url = f"{YOUTUBE_API_BASE}/channels"
-        params = {"part": "snippet,statistics", "id": ",".join(chunk), "maxResults": 50}
-        data = await fetch_json_youtube(session, pool, url, params)
-        for it in data.get("items") or []:
-            cid = safe_str(it.get("id")).strip()
-            if not cid or cid in existing:
-                continue
-            stats = it.get("statistics") or {}
-            subs = to_int(stats.get("subscriberCount"))
-            if subs < cfg.discover_min_subs or subs > cfg.discover_max_subs:
-                continue
-            sn = it.get("snippet") or {}
-            new_rows.append({
-                "channel_id": cid,
-                "title": safe_str(sn.get("title")),
-                "handle": safe_str(sn.get("customUrl")),
-                "avatar_url": safe_str(((sn.get("thumbnails") or {}).get("default") or {}).get("url")),
-                "subscribers": subs,
-            })
-
-    new_rows = dedupe_rows(new_rows, "channel_id")
-    if new_rows:
-        print(f"[INFO] auto_discover: thêm {len(new_rows)} kênh mới.")
-        upsert_channels(client, new_rows, dry_run=cfg.dry_run)
-
-    upsert_scraper_state(client, {"id": 1, "discover_last_date": today, "updated_at": utc_now().isoformat()}, dry_run=cfg.dry_run)
-    return len(new_rows)
-
+# =============================
+# Main loop
+# =============================
 async def run_async(cfg: Cfg) -> None:
+    if not cfg.youtube_keys:
+        raise RuntimeError("Thiếu YouTube API key. Set YOUTUBE_API_KEYS hoặc YOUTUBE_API_KEY.")
+
     pool = ApiKeyPool(cfg.youtube_keys)
     client = supa(cfg)
 
-    channel_ids = list_channels_to_scan(client, limit=cfg.max_channels_per_run)
-    if not channel_ids:
-        print("[INFO] Không có kênh nào trong bảng channels.")
-        return
+    state = get_scraper_state(client)
 
-    sem = asyncio.Semaphore(cfg.concurrency)
-    timeout = aiohttp.ClientTimeout(total=50)
-
-    upsert_scraper_state(client, {
+    _supa_safe_upsert_scraper_state(client, {
         "id": 1,
         "status": "running",
-        "message": f"Scanning {len(channel_ids)} channels",
+        "message": "Starting…",
         "updated_at": utc_now().isoformat(),
-        "run_started_at": utc_now().isoformat(),
-        "progress": 0,
         "pct": 0,
-    }, dry_run=cfg.dry_run)
+        "progress": 0,
+    })
 
-    all_ch: List[Dict[str, Any]] = []
-    all_v: List[Dict[str, Any]] = []
-    all_s: List[Dict[str, Any]] = []
+    timeout = aiohttp.ClientTimeout(total=60)
+    sem = asyncio.Semaphore(cfg.concurrency)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
+        # ✅ Auto-Discover — run FIRST (but only once per 24h)
+        if _should_run_discover_daily(state):
+            try:
+                added = await auto_discover_new_channels(session, pool, client)
+                _supa_safe_upsert_scraper_state(client, {
+                    "id": 1,
+                    "status": "running",
+                    "message": f"Auto-discover added {added} channels",
+                    "updated_at": utc_now().isoformat(),
+                    "last_discover_at": utc_now().isoformat(),
+                    "last_discover_added": added,
+                })
+            except QuotaExceeded as qe:
+                # Stop safely – can't continue scanning reliably if quota is exhausted
+                _supa_safe_upsert_scraper_state(client, {
+                    "id": 1,
+                    "status": "quota_exhausted",
+                    "message": str(qe)[:500],
+                    "updated_at": utc_now().isoformat(),
+                })
+                raise
+            except Exception as e:
+                print(f"[WARN] auto_discover failed (ignored): {e}")
+        else:
+            print("[INFO] auto_discover skipped (already ran <24h).")
 
-        async def worker(ch_id: str, idx: int):
+        # Load channels AFTER discover
+        channel_ids = list_channels_to_scan(client, cfg.max_channels_per_run)
+        if not channel_ids:
+            _supa_safe_upsert_scraper_state(client, {
+                "id": 1,
+                "status": "ok",
+                "message": "No channels to scan",
+                "updated_at": utc_now().isoformat(),
+                "pct": 100,
+                "progress": 0,
+            })
+            return
+
+        all_ch: List[Dict[str, Any]] = []
+        all_v: List[Dict[str, Any]] = []
+        all_s: List[Dict[str, Any]] = []
+
+        async def worker(cid: str):
             async with sem:
-                return await scan_one_channel(session, pool, client, ch_id, cfg)
+                return await scan_one_channel(session, pool, client, cid, cfg)
 
-        tasks = [asyncio.create_task(worker(cid, i)) for i, cid in enumerate(channel_ids)]
+        tasks = [asyncio.create_task(worker(cid)) for cid in channel_ids]
         done = 0
 
         for fut in asyncio.as_completed(tasks):
@@ -637,62 +773,53 @@ async def run_async(cfg: Cfg) -> None:
                 all_v.extend(v_rows)
                 all_s.extend(s_rows)
             except QuotaExceeded as qe:
-                upsert_scraper_state(client, {
+                _supa_safe_upsert_scraper_state(client, {
                     "id": 1,
                     "status": "quota_exhausted",
                     "message": str(qe)[:500],
                     "updated_at": utc_now().isoformat(),
-                }, dry_run=cfg.dry_run)
+                })
                 raise
             except Exception as e:
                 print(f"[WARN] scan channel fail: {e}")
             finally:
                 done += 1
                 if done % 2 == 0 or done == len(channel_ids):
-                    upsert_scraper_state(client, {
+                    _supa_safe_upsert_scraper_state(client, {
                         "id": 1,
                         "status": "running",
-                        "message": f"Scanning... {done}/{len(channel_ids)}",
+                        "message": f"Scanning {done}/{len(channel_ids)}",
                         "updated_at": utc_now().isoformat(),
                         "progress": done,
                         "pct": int(done / max(1, len(channel_ids)) * 100),
-                    }, dry_run=cfg.dry_run)
+                    })
 
-        # Write DB
-        print(f"[INFO] channels={len(all_ch)} videos={len(all_v)} snapshots={len(all_s)}")
-        upsert_channels(client, all_ch, dry_run=cfg.dry_run)
-        upsert_videos(client, all_v, dry_run=cfg.dry_run)
-        insert_snapshots(client, all_s, dry_run=cfg.dry_run)
+        print(f"[INFO] collected: channels={len(all_ch)} videos={len(all_v)} snapshots={len(all_s)}")
 
-        # Auto discover (daily)
-        try:
-            added = await auto_discover_channels(session, pool, client, cfg)
-            if added:
-                print(f"[INFO] auto_discover added={added}")
-        except QuotaExceeded as qe:
-            print(f"[WARN] auto_discover stopped due quota: {qe}")
+        # DB writes (dedupe inside)
+        upsert_channels(client, all_ch, cfg.dry_run)
+        upsert_videos(client, all_v, cfg.dry_run)        # ✅ includes niche/sentiment/country_target/estimated_rpm
+        insert_snapshots(client, all_s, cfg.dry_run)
 
-    upsert_scraper_state(client, {
+    _supa_safe_upsert_scraper_state(client, {
         "id": 1,
         "status": "ok",
         "message": "Done",
         "updated_at": utc_now().isoformat(),
         "last_run_at": utc_now().isoformat(),
-        "progress": len(channel_ids),
         "pct": 100,
-    }, dry_run=cfg.dry_run)
+        "progress": len(channel_ids),
+    })
 
-def main():
+
+def main() -> None:
     cfg = load_cfg()
-    # Validate YouTube keys existence but allow running even if you only want auto-discover off? -> still needed for scan
-    if not cfg.youtube_keys or not any(cfg.youtube_keys):
-        raise RuntimeError("Thiếu YouTube API key. Set YOUTUBE_API_KEYS hoặc YOUTUBE_API_KEY.")
     try:
         asyncio.run(run_async(cfg))
-    except QuotaExceeded as qe:
-        print("[FATAL] Tất cả request bị quotaExceeded. Dừng an toàn.")
-        print(f"[FATAL] {qe}")
+    except QuotaExceeded:
+        print("[FATAL] quotaExceeded -> dừng an toàn (exit 2)")
         raise SystemExit(2)
+
 
 if __name__ == "__main__":
     main()
