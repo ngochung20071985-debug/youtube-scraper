@@ -47,7 +47,19 @@ from supabase import create_client, Client
 # =============================
 # 1) Auto-Discover keywords (bạn tự sửa list này)
 # =============================
-TARGET_KEYWORDS = ["kiếm tiền online", "tóm tắt phim", "AI tools", "kể chuyện ma", "review công nghệ"]
+TARGET_KEYWORDS = [
+    "make money online",
+    "faceless youtube automation",
+    "scary stories animated",
+    "tech gadgets review",
+    "movie recap",
+    "stoicism",
+    "personal finance for beginners",
+    "ai tools review",
+    "productivity systems",
+    "true crime documentary",
+    "self improvement",
+]
 
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
