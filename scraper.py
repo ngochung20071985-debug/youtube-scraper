@@ -86,6 +86,16 @@ def to_float(x: Any) -> Optional[float]:
     except Exception:
         return None
 
+def derive_uploads_playlist_id(channel_id: str) -> Optional[str]:
+    """
+    Fallback uploads playlist:
+      UCxxxxxxxxxxxxxxxxxxxxxx -> UUxxxxxxxxxxxxxxxxxxxxxx
+    """
+    channel_id = (channel_id or "").strip()
+    if channel_id.startswith("UC") and len(channel_id) > 2:
+        return "UU" + channel_id[2:]
+    return None
+
 def env_optional(name: str, default: Optional[str] = None) -> Optional[str]:
     v = os.getenv(name, default)
     if v is None:
@@ -612,8 +622,17 @@ async def scan_one_channel(
     cfg: Cfg,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     # Get channel (snippet/stats/contentDetails)
-    items = await yt_channels_by_ids(session, pool, [channel_id])
+    try:
+        items = await yt_channels_by_ids(session, pool, [channel_id])
+    except QuotaExceeded as qe:
+        print(f"[FATAL][QUOTA] {qe}")
+        raise
+    except Exception as e:
+        print(f"[ERROR] channels.list FAILED for channel_id={channel_id} -> {e}")
+        raise
+
     if not items:
+        print(f"[WARN] channels.list returned empty for channel_id={channel_id}. Bỏ qua.")
         return [], [], []
     ch_item = items[0]
 
@@ -623,6 +642,21 @@ async def scan_one_channel(
     rel = (content.get("relatedPlaylists") or {})
     uploads_pid = safe_str(rel.get("uploads")).strip()
 
+    # ----- PRINT: bắt đầu xử lý kênh -----
+    ch_title = safe_str(snippet.get("title")).strip() or "(No title)"
+    print(f"\n[SCAN] Đang xử lý kênh: {ch_title} (ID: {channel_id})")
+# ----- FALLBACK: nếu API không có uploads_pid thì tự tạo UC->UU -----
+    if not uploads_pid:
+        fallback = derive_uploads_playlist_id(channel_id)
+        if fallback:
+            uploads_pid = fallback
+            print(f"[SCAN] Đã tạo Uploads Playlist ID: {uploads_pid} (fallback UC→UU)")
+        else:
+            print(f"[ERROR] Không lấy được uploads_playlist_id và cũng không tạo được fallback từ channel_id={channel_id}. Bỏ qua kênh này.")
+            return [], [], []
+    else:
+        print(f"[SCAN] Uploads Playlist ID (API): {uploads_pid}")
+
     channels_rows = [{
         "channel_id": channel_id,
         "title": safe_str(snippet.get("title")),
@@ -631,11 +665,29 @@ async def scan_one_channel(
         "subscribers": to_int(stats.get("subscriberCount")),
     }]
 
-    video_ids: List[str] = []
-    if uploads_pid:
-        video_ids = await yt_playlist_items_video_ids(session, pool, uploads_pid, limit=cfg.max_videos_per_channel)
+    # ----- Gọi playlistItems.list để lấy videoIds -----
+    try:
+        video_ids: List[str] = await yt_playlist_items_video_ids(
+            session, pool, uploads_pid, limit=cfg.max_videos_per_channel
+        )
+        print(f"[SCAN] Tìm thấy {len(video_ids)} video mới cho kênh này.")
+    except QuotaExceeded as qe:
+        print(f"[FATAL][QUOTA] {qe}")
+        raise
+    except Exception as e:
+        print(f"[ERROR] playlistItems.list FAILED for uploads_pid={uploads_pid} channel_id={channel_id} -> {e}")
+        raise
 
-    v_items = await yt_videos_by_ids(session, pool, video_ids)
+    if not video_ids:
+        print(f"[WARN] Kênh {ch_title} không trả về video nào từ uploads playlist. (uploads_pid={uploads_pid})")
+    try:
+        v_items = await yt_videos_by_ids(session, pool, video_ids)
+    except QuotaExceeded as qe:
+        print(f"[FATAL][QUOTA] {qe}")
+        raise
+    except Exception as e:
+        print(f"[ERROR] videos.list FAILED for channel_id={channel_id} (n_ids={len(video_ids)}) -> {e}")
+        raise
 
     now_iso = utc_now().isoformat()
 
@@ -793,7 +845,7 @@ async def run_async(cfg: Cfg) -> None:
                 })
                 raise
             except Exception as e:
-                print(f"[WARN] scan channel fail: {e}")
+                print(f"[WARN] scan channel fail: {e}"); import traceback; traceback.print_exc()
             finally:
                 done += 1
                 if done % 2 == 0 or done == len(channel_ids):
