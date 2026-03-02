@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   schedule:
     # chạy mỗi 4 tiếng (UTC)
-    - cron: "0 */4 * * *"
+    - cron: "0 * * * *"
 
 jobs:
   run-scraper:
