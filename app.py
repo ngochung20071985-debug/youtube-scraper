@@ -1,684 +1,758 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-scraper.py — Background worker quét YouTube API v3 và ghi vào Supabase (PostgreSQL)
-
-✅ Async + aiohttp
-✅ Ghi dữ liệu vào: channels, videos, snapshots (+ scraper_state nếu có)
-✅ Auto-Discover kênh mới ở ĐẦU mỗi run (YouTube Search API, type=channel)
-✅ Multi-key: YOUTUBE_API_KEYS="k1,k2,k3" (fallback rotate khi key lỗi / service chưa bật)
-
-ENV bắt buộc:
-- SUPABASE_URL
-- SUPABASE_SERVICE_ROLE_KEY
-
-ENV YouTube:
-- YOUTUBE_API_KEYS="key1,key2,key3"   (ưu tiên)
-  hoặc YOUTUBE_API_KEY="key1"         (fallback)
-
-⚠️ QUOTA:
-- Khi gặp quotaExceeded/dailyLimitExceeded/userRateLimitExceeded -> scraper sẽ log cảnh báo và
-  **bỏ qua bước auto-discover**, sau đó tiếp tục quét các kênh đã có (không crash).
-  (Không cố “vượt quota” bằng cách đổi key để tiếp tục gọi search khi quotaExceeded.)
-
-ENV tuỳ chọn:
-- CONCURRENCY=10
-- MAX_VIDEOS_PER_CHANNEL=50
-- MAX_CHANNELS_PER_RUN=0          (0 = không giới hạn)
-- DRY_RUN=0                       (1 = chỉ in log, không ghi DB)
-
-AI (tuỳ chọn):
-- GEMINI_API_KEY=...  (nếu muốn fill niche/sentiment vào bảng videos)
-
-"""
+# app.py
+# Streamlit frontend (Supabase only) — NexLev-style layout
+# ✅ NO YouTube API calls here. Only SELECT/INSERT/DELETE via Supabase.
+# ✅ Handles empty DB safely (no .get(...).fillna() traps).
 
 from __future__ import annotations
 
-import os
-import json
+import math
 import re
-import random
-import asyncio
-from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-import aiohttp
+import pandas as pd
+import streamlit as st
 from supabase import create_client, Client
 
 
-# =============================
-# ✅ Auto-Discover keywords (bạn tự sửa list này)
-# =============================
-TARGET_KEYWORDS = ["kiếm tiền online", "truyện đêm khuya", "AI tools", "tóm tắt phim", "gameplay"]
+# -----------------------------
+# Config / Page
+# -----------------------------
+APP_TITLE = "toolwatch • NexLev-style (Supabase)"
+st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide", initial_sidebar_state="expanded")
 
 
-YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
-GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+# -----------------------------
+# Styling (NexLev-ish dark)
+# -----------------------------
+CSS = """
+<style>
+:root{
+  --bg0:#090a0b;
+  --bg1:#0c0d0f;
+  --panel:#121417;
+  --panel2:#171a1f;
+  --stroke:rgba(255,255,255,.08);
+  --muted:rgba(255,255,255,.65);
+  --muted2:rgba(255,255,255,.50);
+  --text:#f4f6f8;
+  --accent:#e11d48;     /* red-ish */
+  --good:#22c55e;       /* green */
+  --blue:#3b82f6;       /* blue */
+  --card-radius:16px;
+  --shadow: 0 12px 32px rgba(0,0,0,.45);
+}
+
+/* App background */
+.stApp{
+  background:
+    radial-gradient(1200px 600px at 10% 10%, rgba(59,130,246,.13), transparent 60%),
+    radial-gradient(900px 520px at 90% 10%, rgba(34,197,94,.10), transparent 55%),
+    radial-gradient(900px 600px at 20% 90%, rgba(225,29,72,.08), transparent 60%),
+    linear-gradient(180deg, var(--bg0), var(--bg1));
+  color: var(--text);
+}
+
+/* Sidebar */
+section[data-testid="stSidebar"]{
+  background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.03));
+  border-right: 1px solid var(--stroke);
+}
+section[data-testid="stSidebar"] *{ color: var(--text) !important; }
+
+/* Hide Streamlit collapse control (prevents "ẩn hẳn" bug) */
+button[data-testid="stSidebarCollapseButton"]{ display:none !important; }
+div[data-testid="collapsedControl"]{ display:none !important; }
+
+/* Top title pill */
+.tw-top{
+  display:flex; align-items:center; justify-content:space-between;
+  gap: 12px;
+  background: rgba(255,255,255,.04);
+  border: 1px solid var(--stroke);
+  border-radius: 999px;
+  padding: 10px 14px;
+  box-shadow: var(--shadow);
+}
+.tw-pill{
+  display:inline-flex; align-items:center; gap:8px;
+  font-weight:700;
+  letter-spacing:.2px;
+}
+.tw-badges{ display:flex; gap:8px; align-items:center; }
+.tw-badge{
+  border:1px solid var(--stroke);
+  background: rgba(255,255,255,.04);
+  padding:6px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* KPI strip */
+.tw-kpi{
+  border-top: 1px solid var(--stroke);
+  border-bottom: 1px solid var(--stroke);
+  padding: 18px 0;
+  margin-top: 14px;
+}
+.tw-kpi .kpi-label{ color: var(--muted2); font-size: 12px; }
+.tw-kpi .kpi-value{ font-size: 34px; font-weight: 800; }
+
+/* Section divider */
+.tw-divider{
+  border-top: 1px solid var(--stroke);
+  margin: 18px 0;
+}
+
+/* Cards */
+.tw-card{
+  border: 1px solid var(--stroke);
+  background: rgba(255,255,255,.035);
+  border-radius: var(--card-radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.tw-card .body{ padding: 12px 12px 10px 12px; }
+.tw-title{
+  font-weight: 800;
+  font-size: 14px;
+  line-height: 1.25;
+  margin: 0 0 6px 0;
+}
+.tw-sub{
+  color: var(--muted2);
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+.tw-metrics{
+  display:flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.tw-chip{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  border: 1px solid var(--stroke);
+  background: rgba(0,0,0,.25);
+  padding: 5px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  color: rgba(255,255,255,.80);
+}
+.tw-chip.good{
+  border-color: rgba(34,197,94,.4);
+  background: rgba(34,197,94,.12);
+}
+.tw-chip.hot{
+  border-color: rgba(245,158,11,.45);
+  background: rgba(245,158,11,.10);
+}
+.tw-thumb-wrap{ position: relative; }
+.tw-badge-top{
+  position:absolute; top:10px; left:10px;
+  display:inline-flex; align-items:center; gap:8px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(34,197,94,.5);
+  background: rgba(34,197,94,.16);
+  font-weight: 800;
+  font-size: 12px;
+}
+.tw-badge-top span{ color: rgba(255,255,255,.92); }
+
+/* Small metric tiles (Tab2 gap filler) */
+.tw-tiles{
+  display:grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+.tw-tile{
+  border:1px solid var(--stroke);
+  background: rgba(255,255,255,.03);
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+.tw-tile .t{ color: var(--muted2); font-size: 12px; }
+.tw-tile .v{ font-size: 18px; font-weight: 800; margin-top: 2px; }
+
+/* Tables */
+[data-testid="stDataFrame"]{
+  border: 1px solid var(--stroke);
+  border-radius: 12px;
+  overflow:hidden;
+}
+</style>
+"""
+st.markdown(CSS, unsafe_allow_html=True)
+
+
+# -----------------------------
+# Supabase
+# -----------------------------
+@st.cache_resource(show_spinner=False)
+def get_client() -> Client:
+    url = st.secrets.get("SUPABASE_URL")
+    key = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
+    if not url or not key:
+        raise RuntimeError("Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_ROLE_KEY trong st.secrets")
+    return create_client(url, key)
 
 
 # -----------------------------
 # Helpers
 # -----------------------------
-def utc_now() -> datetime:
+def fmt_int(n: Any) -> str:
+    try:
+        n = int(n)
+    except Exception:
+        return "0"
+    if n >= 1_000_000_000:
+        return f"{n/1_000_000_000:.2f}B"
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.2f}K"
+    return str(n)
+
+def fmt_money(n: Any) -> str:
+    try:
+        n = float(n)
+    except Exception:
+        n = 0.0
+    sign = "-" if n < 0 else ""
+    n = abs(n)
+    if n >= 1_000_000:
+        return f"{sign}${n/1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{sign}${n/1_000:.2f}K"
+    return f"{sign}${n:.2f}"
+
+def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-def safe_str(x: Any) -> str:
-    return "" if x is None else str(x)
-
-def to_int(x: Any) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return 0
-
-def _env_optional(name: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.getenv(name, default)
-    if v is None:
+def to_dt(s: Any) -> Optional[datetime]:
+    if s is None or s == "":
         return None
-    v = str(v).strip()
-    return v if v else None
-
-def _env_required(name: str) -> str:
-    v = _env_optional(name)
-    if not v:
-        raise RuntimeError(f"Thiếu biến môi trường: {name}")
-    return v
-
-def _env_int(name: str, default: int) -> int:
-    v = _env_optional(name)
-    if not v:
-        return int(default)
     try:
-        return int(v)
+        return pd.to_datetime(s, utc=True).to_pydatetime()
     except Exception:
-        return int(default)
+        return None
 
-def chunked(xs: List[Any], n: int) -> List[List[Any]]:
-    return [xs[i:i+n] for i in range(0, len(xs), n)]
+def ensure_df(df: Optional[pd.DataFrame], cols: Dict[str, Any]) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return pd.DataFrame({k: pd.Series(dtype="object") for k in cols.keys()})
+    for c, default in cols.items():
+        if c not in df.columns:
+            df[c] = default
+    return df
 
-def dedupe_rows(rows: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
-    """Tránh lỗi Postgres: 'ON CONFLICT DO UPDATE command cannot affect row a second time'."""
-    out: Dict[str, Dict[str, Any]] = {}
-    for r in rows:
-        k = safe_str(r.get(key)).strip()
-        if not k:
-            continue
-        out[k] = r
-    return list(out.values())
+def yt_thumb(video_id: str) -> str:
+    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
 
+def yt_url(video_id: str) -> str:
+    return f"https://www.youtube.com/watch?v={video_id}"
 
-# -----------------------------
-# API Key pool (fallback)
-# -----------------------------
-class QuotaExceeded(RuntimeError):
-    pass
-
-class ApiKeyPool:
-    def __init__(self, keys: List[str]):
-        keys = [k.strip() for k in keys if k and k.strip()]
-        if not keys:
-            raise RuntimeError("Không có YouTube API key (YOUTUBE_API_KEYS hoặc YOUTUBE_API_KEY).")
-        self._keys = keys
-        self._i = 0
-        self._lock = asyncio.Lock()
-
-    async def current(self) -> str:
-        async with self._lock:
-            return self._keys[self._i]
-
-    async def rotate(self) -> str:
-        async with self._lock:
-            self._i = (self._i + 1) % len(self._keys)
-            return self._keys[self._i]
-
-    async def size(self) -> int:
-        return len(self._keys)
-
-
-# -----------------------------
-# Config
-# -----------------------------
-@dataclass
-class Cfg:
-    supabase_url: str
-    supabase_key: str
-    youtube_keys: List[str]
-    concurrency: int = 10
-    max_videos_per_channel: int = 50
-    max_channels_per_run: int = 0
-    dry_run: bool = False
-    gemini_api_key: Optional[str] = None
-
-def load_cfg() -> Cfg:
-    ykeys = _env_optional("YOUTUBE_API_KEYS")
-    if ykeys:
-        keys = [k.strip() for k in ykeys.split(",") if k.strip()]
-    else:
-        k1 = _env_optional("YOUTUBE_API_KEY")
-        keys = [k1] if k1 else []
-
-    return Cfg(
-        supabase_url=_env_required("SUPABASE_URL"),
-        supabase_key=_env_required("SUPABASE_SERVICE_ROLE_KEY"),
-        youtube_keys=keys,
-        concurrency=_env_int("CONCURRENCY", 10),
-        max_videos_per_channel=_env_int("MAX_VIDEOS_PER_CHANNEL", 50),
-        max_channels_per_run=_env_int("MAX_CHANNELS_PER_RUN", 0),
-        dry_run=(_env_optional("DRY_RUN", "0") == "1"),
-        gemini_api_key=_env_optional("GEMINI_API_KEY"),
-    )
-
-def supa(cfg: Cfg) -> Client:
-    return create_client(cfg.supabase_url, cfg.supabase_key)
-
-
-# -----------------------------
-# YouTube fetch with fallback
-# -----------------------------
-def _parse_yt_error(text: str) -> Tuple[str, str]:
-    """Return (reason, message)."""
-    try:
-        j = json.loads(text)
-        err = j.get("error") or {}
-        msg = safe_str(err.get("message"))
-        errors = err.get("errors") or []
-        reason = safe_str(errors[0].get("reason")) if errors else ""
-        return reason, msg
-    except Exception:
-        return "", (text or "")[:250]
-
-async def fetch_json_youtube(
-    session: aiohttp.ClientSession,
-    pool: ApiKeyPool,
-    endpoint: str,
-    params: Dict[str, Any],
-    *,
-    retries: int = 2,
-    backoff: float = 1.4,
-) -> Dict[str, Any]:
+def parse_channel_input(s: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    - Inject key from ApiKeyPool.
-    - Rotate when: keyInvalid / accessNotConfigured (key lỗi, project chưa bật API).
-    - If quotaExceeded -> raise QuotaExceeded.
+    Return (channel_id, handle) based on user input.
+    UI/frontend doesn't call YouTube API => must provide UC... to be scannable.
     """
-    last_err: Optional[Exception] = None
+    s = (s or "").strip()
+    if not s:
+        return None, None
 
-    for attempt in range(retries + 1):
-        api_key = await pool.current()
-        p = dict(params)
-        p["key"] = api_key
+    # Direct UC...
+    m = re.search(r"(UC[a-zA-Z0-9_-]{10,})", s)
+    if m:
+        return m.group(1), None
 
-        try:
-            async with session.get(endpoint, params=p, timeout=aiohttp.ClientTimeout(total=35)) as resp:
-                txt = await resp.text()
-                if resp.status < 400:
-                    return await resp.json()
+    # Handle @...
+    m = re.search(r"@([A-Za-z0-9_.-]{2,})", s)
+    if m:
+        return None, "@"+m.group(1)
 
-                reason, msg = _parse_yt_error(txt)
-
-                if resp.status == 403 and reason in ("quotaExceeded", "dailyLimitExceeded", "userRateLimitExceeded"):
-                    raise QuotaExceeded(f"Quota exceeded: reason={reason} msg={msg}")
-
-                if resp.status in (400, 403) and reason in ("keyInvalid", "accessNotConfigured"):
-                    if await pool.size() > 1:
-                        nxt = await pool.rotate()
-                        print(f"[WARN] Key lỗi ({reason}). Đổi sang key tiếp theo. now={nxt[:6]}…")
-                        await asyncio.sleep(0.2)
-                        continue
-
-                raise RuntimeError(f"HTTP {resp.status} reason={reason} msg={msg}")
-
-        except QuotaExceeded:
-            raise
-        except Exception as e:
-            last_err = e
-            await asyncio.sleep(backoff ** attempt)
-
-    raise RuntimeError(f"Request failed after retries: {endpoint} params={list(params.keys())}") from last_err
+    return None, None
 
 
 # -----------------------------
-# YouTube API wrappers
+# DB Fetch (cached)
 # -----------------------------
-async def yt_channels(session: aiohttp.ClientSession, pool: ApiKeyPool, channel_id: str) -> Optional[Dict[str, Any]]:
-    url = f"{YOUTUBE_API_BASE}/channels"
-    params = {"part": "snippet,statistics,contentDetails", "id": channel_id, "maxResults": 1}
-    data = await fetch_json_youtube(session, pool, url, params)
-    items = data.get("items") or []
-    return items[0] if items else None
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_channels() -> pd.DataFrame:
+    client = get_client()
+    resp = client.table("channels").select("id,channel_id,title,handle,avatar_url,subscribers,created_at").order("created_at", desc=False).execute()
+    df = pd.DataFrame(resp.data or [])
+    df = ensure_df(df, {
+        "id": None,
+        "channel_id": "",
+        "title": "",
+        "handle": "",
+        "avatar_url": "",
+        "subscribers": 0,
+        "created_at": "",
+    })
+    df["subscribers"] = pd.to_numeric(df["subscribers"], errors="coerce").fillna(0).astype(int)
+    return df
 
-async def yt_videos(session: aiohttp.ClientSession, pool: ApiKeyPool, video_ids: List[str]) -> List[Dict[str, Any]]:
-    if not video_ids:
-        return []
-    url = f"{YOUTUBE_API_BASE}/videos"
-    items: List[Dict[str, Any]] = []
-    for chunk in chunked(video_ids, 50):
-        params = {"part": "snippet,statistics,contentDetails", "id": ",".join(chunk), "maxResults": 50}
-        data = await fetch_json_youtube(session, pool, url, params)
-        items.extend(data.get("items") or [])
-    return items
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_videos(limit: int = 5000) -> pd.DataFrame:
+    client = get_client()
+    resp = client.table("videos").select(
+        "video_id,channel_id,published_at,title,description,tags_json,niche,sentiment"
+    ).order("published_at", desc=True).limit(limit).execute()
+    df = pd.DataFrame(resp.data or [])
+    df = ensure_df(df, {
+        "video_id": "",
+        "channel_id": "",
+        "published_at": None,
+        "title": "",
+        "description": "",
+        "tags_json": "",
+        "niche": "",
+        "sentiment": "",
+    })
+    df["published_at"] = pd.to_datetime(df["published_at"], utc=True, errors="coerce")
+    return df
 
-async def yt_playlist_items_video_ids(
-    session: aiohttp.ClientSession,
-    pool: ApiKeyPool,
-    uploads_playlist_id: str,
-    *,
-    limit: int,
-) -> List[str]:
-    """Lấy video_ids từ uploads playlist (rẻ quota hơn search.list)."""
-    url = f"{YOUTUBE_API_BASE}/playlistItems"
-    video_ids: List[str] = []
-    page_token: Optional[str] = None
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_snapshots_recent(limit: int = 50000) -> pd.DataFrame:
+    client = get_client()
+    resp = client.table("snapshots").select(
+        "id,video_id,captured_at,view_count,like_count,comment_count"
+    ).order("captured_at", desc=True).limit(limit).execute()
+    df = pd.DataFrame(resp.data or [])
+    df = ensure_df(df, {
+        "id": None,
+        "video_id": "",
+        "captured_at": None,
+        "view_count": 0,
+        "like_count": 0,
+        "comment_count": 0,
+    })
+    df["captured_at"] = pd.to_datetime(df["captured_at"], utc=True, errors="coerce")
+    for c in ["view_count", "like_count", "comment_count"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+    return df
 
-    while len(video_ids) < limit:
-        params = {
-            "part": "contentDetails",
-            "playlistId": uploads_playlist_id,
-            "maxResults": min(50, limit - len(video_ids)),
-        }
-        if page_token:
-            params["pageToken"] = page_token
-        data = await fetch_json_youtube(session, pool, url, params)
-
-        for it in data.get("items") or []:
-            cd = it.get("contentDetails") or {}
-            vid = cd.get("videoId")
-            if vid:
-                video_ids.append(vid)
-
-        page_token = data.get("nextPageToken")
-        if not page_token:
-            break
-
-    return video_ids
-
-async def yt_search_channels(session: aiohttp.ClientSession, pool: ApiKeyPool, keyword: str) -> List[Dict[str, Any]]:
-    """Search API (type=channel)."""
-    url = f"{YOUTUBE_API_BASE}/search"
-    params = {
-        "part": "snippet",
-        "q": keyword,
-        "type": "channel",
-        "maxResults": 50,
-        "order": "relevance",
-    }
-    data = await fetch_json_youtube(session, pool, url, params)
-    return data.get("items") or []
-
-
-# -----------------------------
-# Gemini AI (optional)
-# -----------------------------
-async def analyze_video_with_ai(session: aiohttp.ClientSession, gemini_key: str, title: str, description: str) -> Tuple[str, str]:
-    """Return (niche, sentiment). Nếu lỗi -> ("","")"""
-    if not gemini_key:
-        return "", ""
-
-    prompt = f"""
-Bạn là hệ thống phân loại nội dung YouTube.
-Trả về JSON DUY NHẤT theo format:
-{{"niche":"...","sentiment":"..."}}
-Không thêm text ngoài JSON.
-
-TIÊU ĐỀ: {title}
-
-MÔ TẢ: {description[:2000]}
-""".strip()
-
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 256},
-    }
-
-    try:
-        async with session.post(
-            f"{GEMINI_ENDPOINT}?key={gemini_key}",
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=40),
-        ) as resp:
-            if resp.status >= 400:
-                return "", ""
-            j = await resp.json()
-            cand = (j.get("candidates") or [{}])[0]
-            parts = (((cand.get("content") or {}).get("parts")) or [])
-            text_out = " ".join([safe_str(p.get("text")) for p in parts]).strip()
-            if not text_out:
-                return "", ""
-            m = re.search(r"\{.*\}", text_out, re.S)
-            if not m:
-                return "", ""
-            obj = json.loads(m.group(0))
-            niche = safe_str(obj.get("niche")).strip()[:64]
-            sentiment = safe_str(obj.get("sentiment")).strip()[:64]
-            return niche, sentiment
-    except Exception:
-        return "", ""
-
-
-# -----------------------------
-# Supabase ops
-# -----------------------------
-def upsert_channels(client: Client, rows: List[Dict[str, Any]], *, dry_run: bool) -> None:
-    rows = dedupe_rows(rows, "channel_id")
-    if not rows:
-        return
-    if dry_run:
-        print(f"[DRY_RUN] upsert channels: {len(rows)}")
-        return
-    client.table("channels").upsert(rows, on_conflict="channel_id").execute()
-
-def upsert_videos(client: Client, rows: List[Dict[str, Any]], *, dry_run: bool) -> None:
-    rows = dedupe_rows(rows, "video_id")
-    if not rows:
-        return
-    if dry_run:
-        print(f"[DRY_RUN] upsert videos: {len(rows)}")
-        return
-    for chunk in chunked(rows, 250):
-        client.table("videos").upsert(chunk, on_conflict="video_id").execute()
-
-def insert_snapshots(client: Client, rows: List[Dict[str, Any]], *, dry_run: bool) -> None:
-    if not rows:
-        return
-    if dry_run:
-        print(f"[DRY_RUN] insert snapshots: {len(rows)}")
-        return
-    for chunk in chunked(rows, 500):
-        client.table("snapshots").insert(chunk).execute()
-
-def fetch_existing_channel_ids(client: Client) -> set:
-    s = set()
-    r = client.table("channels").select("channel_id").limit(100000).execute()
-    for row in r.data or []:
-        cid = safe_str(row.get("channel_id")).strip()
-        if cid:
-            s.add(cid)
-    return s
-
-def list_channels_to_scan(client: Client, *, limit: int = 0) -> List[str]:
-    q = client.table("channels").select("channel_id").order("created_at", desc=False)
-    if limit and limit > 0:
-        q = q.limit(int(limit))
-    r = q.execute()
-    out = []
-    for row in r.data or []:
-        cid = safe_str(row.get("channel_id")).strip()
-        if cid:
-            out.append(cid)
-    return out
-
-def get_scraper_state(client: Client) -> Dict[str, Any]:
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_scraper_state() -> pd.DataFrame:
+    client = get_client()
     try:
         r = client.table("scraper_state").select("*").order("updated_at", desc=True).limit(1).execute()
-        row = (r.data or [None])[0] or {}
-        return dict(row)
+        df = pd.DataFrame(r.data or [])
+        return df
     except Exception:
-        return {}
+        return pd.DataFrame([])
 
-def upsert_scraper_state(client: Client, payload: Dict[str, Any], *, dry_run: bool) -> None:
-    if dry_run:
-        print("[DRY_RUN] scraper_state:", payload)
+
+def latest_snapshot_per_video(snaps: pd.DataFrame) -> pd.DataFrame:
+    snaps = ensure_df(snaps, {
+        "video_id": "",
+        "captured_at": None,
+        "view_count": 0,
+        "like_count": 0,
+        "comment_count": 0,
+    })
+    if snaps.empty:
+        return snaps[["video_id", "captured_at", "view_count", "like_count", "comment_count"]].copy()
+    snaps = snaps.sort_values("captured_at", ascending=False)
+    out = snaps.drop_duplicates(subset=["video_id"], keep="first").copy()
+    return out[["video_id", "captured_at", "view_count", "like_count", "comment_count"]]
+
+
+# -----------------------------
+# Sidebar (always visible)
+# -----------------------------
+def sidebar_controls(ch_df: pd.DataFrame):
+    with st.sidebar:
+        st.markdown("### ⚙️ Điều khiển")
+        if st.button("🔄 Refresh dữ liệu", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
+        st.markdown("### 🤖 Trạng thái robot")
+        st_state = fetch_scraper_state()
+        if st_state.empty:
+            st.caption("Chưa có scraper_state hoặc chưa chạy lần nào.")
+        else:
+            row = st_state.iloc[0].to_dict()
+            updated = to_dt(row.get("updated_at"))
+            status = row.get("status", "unknown")
+            msg = str(row.get("message", ""))[:120]
+            pct = row.get("pct", None)
+            st.caption(f"Lần cập nhật gần nhất: **{updated.strftime('%H:%M %d/%m/%Y') if updated else 'N/A'}**")
+            st.caption(f"Trạng thái: **{status}**")
+            if msg:
+                st.caption(msg)
+            # Scan mỗi 1 giờ (hiển thị progress theo chu kỳ)
+            if updated:
+                elapsed = (now_utc() - updated).total_seconds()
+                cycle = 3600.0
+                progress = min(0.999, max(0.0, elapsed / cycle))
+                st.progress(progress, text=f"Chu kỳ 1 giờ: {int(progress*100)}%")
+                if elapsed > 7200:
+                    st.warning("Dữ liệu có vẻ đã quá lâu chưa cập nhật (>2 giờ). Kiểm tra GitHub Actions.")
+            if pct is not None:
+                try:
+                    st.progress(min(1.0, max(0.0, float(pct)/100.0)), text=f"Tiến trình job: {pct}%")
+                except Exception:
+                    pass
+
+        st.divider()
+
+        st.markdown("### ➕ Thêm kênh")
+        raw = st.text_input("UC... hoặc URL /channel/UC...", placeholder="UCxxxx... hoặc https://youtube.com/channel/UC...")
+        if st.button("Thêm kênh", use_container_width=True):
+            cid, handle = parse_channel_input(raw)
+            if not cid:
+                st.error("Frontend không gọi YouTube API nên **bắt buộc nhập Channel ID bắt đầu bằng UC...**")
+            else:
+                try:
+                    client = get_client()
+                    # Insert minimal row. Scraper sẽ cập nhật title/avatar/subscribers sau.
+                    client.table("channels").upsert(
+                        {"channel_id": cid, "handle": handle or "", "title": "", "avatar_url": "", "subscribers": 0},
+                        on_conflict="channel_id"
+                    ).execute()
+                    st.success(f"Đã thêm kênh: {cid}")
+                    st.cache_data.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Không thêm được kênh: {e}")
+
+        st.divider()
+
+        st.markdown("### 🗑️ Xóa kênh")
+        if ch_df.empty:
+            st.caption("Chưa có kênh.")
+        else:
+            options = [f"{r.get('title') or r.get('handle') or r.get('channel_id')} • {r.get('channel_id')}" for _, r in ch_df.iterrows()]
+            pick = st.selectbox("Chọn kênh", options=options)
+            del_with_related = st.toggle("Xóa kèm videos/snapshots", value=False)
+            if st.button("Xóa kênh", use_container_width=True, type="primary"):
+                try:
+                    client = get_client()
+                    channel_id = pick.split("•")[-1].strip()
+                    if del_with_related:
+                        vids = client.table("videos").select("video_id").eq("channel_id", channel_id).limit(10000).execute().data or []
+                        vid_ids = [v.get("video_id") for v in vids if v.get("video_id")]
+                        # delete snapshots by video ids (chunked)
+                        for chunk in [vid_ids[i:i+200] for i in range(0, len(vid_ids), 200)]:
+                            client.table("snapshots").delete().in_("video_id", chunk).execute()
+                        client.table("videos").delete().eq("channel_id", channel_id).execute()
+                    client.table("channels").delete().eq("channel_id", channel_id).execute()
+                    st.success("Đã xóa.")
+                    st.cache_data.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Xóa thất bại: {e}")
+
+        st.divider()
+
+        st.markdown("### 💵 RPM (ước tính)")
+        # Avoid SessionState warning by initializing once.
+        if "rpm_long" not in st.session_state:
+            st.session_state["rpm_long"] = 1.2
+        if "rpm_shorts" not in st.session_state:
+            st.session_state["rpm_shorts"] = 0.25
+        rpm_long = st.slider("RPM video dài", 0.1, 30.0, float(st.session_state["rpm_long"]), 0.1, key="rpm_long")
+        rpm_shorts = st.slider("RPM shorts", 0.01, 10.0, float(st.session_state["rpm_shorts"]), 0.01, key="rpm_shorts")
+        st.caption("RPM chỉ là **ước tính**, phụ thuộc quốc gia/ngách/độ dài video.")
+
+        return rpm_long, rpm_shorts
+
+
+# -----------------------------
+# Tab 1 — Outlier Radar (new)
+# -----------------------------
+def tab_outlier_radar(ch_df: pd.DataFrame, vid_df: pd.DataFrame, snap_latest: pd.DataFrame):
+    st.subheader("🏠 Trang chủ (Outlier Radar)")
+
+    if ch_df.empty or vid_df.empty or snap_latest.empty:
+        st.info("DB chưa đủ dữ liệu để tính Outlier Radar (cần channels + videos + snapshots).")
         return
-    try:
-        payload = dict(payload)
-        payload.setdefault("id", 1)
-        client.table("scraper_state").upsert(payload, on_conflict="id").execute()
-    except Exception:
-        pass
 
+    # Merge 3 tables: videos + channels + latest snapshot per video
+    merged = vid_df.merge(ch_df[["channel_id", "title", "handle", "avatar_url", "subscribers"]].rename(columns={"title": "channel_title"}), on="channel_id", how="left")
+    merged = merged.merge(snap_latest, on="video_id", how="left")
 
-# =============================
-# ✅ Auto-Discover (run at START)
-# =============================
-async def auto_discover_new_channels(
-    session: aiohttp.ClientSession,
-    pool: ApiKeyPool,
-    client: Client,
-    *,
-    max_insert: int = 50,
-) -> int:
-    """
-    - Random chọn 1–2 keyword trong TARGET_KEYWORDS
-    - Search type=channel maxResults=50
-    - Lấy channel_id, title, avatar_url
-    - Insert (upsert) vào Supabase nếu chưa có
-    - Nếu gặp quotaExceeded -> skip discover (không crash)
-    """
-    if not TARGET_KEYWORDS:
-        return 0
+    merged = ensure_df(merged, {
+        "published_at": pd.NaT,
+        "view_count": 0,
+        "subscribers": 0,
+        "title": "",
+        "channel_title": "",
+    })
 
-    k = 1 if len(TARGET_KEYWORDS) == 1 else random.choice([1, 2])
-    keywords = random.sample(TARGET_KEYWORDS, k=k)
+    merged["published_at"] = pd.to_datetime(merged["published_at"], utc=True, errors="coerce")
+    merged["view_count"] = pd.to_numeric(merged["view_count"], errors="coerce").fillna(0).astype(int)
+    merged["subscribers"] = pd.to_numeric(merged["subscribers"], errors="coerce").fillna(0).astype(int)
 
-    existing = fetch_existing_channel_ids(client)
-    new_rows: List[Dict[str, Any]] = []
+    days30 = now_utc() - timedelta(days=30)
+    cond = (
+        (merged["published_at"].notna()) &
+        (merged["published_at"] >= pd.Timestamp(days30)) &
+        (merged["view_count"] > 0) &
+        (merged["subscribers"] > 0)
+    )
+    merged = merged.loc[cond].copy()
+    if merged.empty:
+        st.info("Không có video nào trong 30 ngày qua đủ điều kiện (view>0, subs>0).")
+        return
 
-    print(f"[INFO] auto_discover: keywords={keywords}")
+    merged["viral_score"] = merged["view_count"] / merged["subscribers"].replace({0: math.nan})
+    merged = merged[merged["viral_score"] >= 3.0].copy()
+    merged = merged.sort_values("viral_score", ascending=False)
 
-    try:
-        for kw in keywords:
-            items = await yt_search_channels(session, pool, kw)
-            for it in items:
-                cid = safe_str(((it.get("id") or {}).get("channelId"))).strip()
-                if not cid or cid in existing:
-                    continue
-                sn = it.get("snippet") or {}
-                title = safe_str(sn.get("title")).strip()
-                thumbs = sn.get("thumbnails") or {}
-                avatar = safe_str((thumbs.get("default") or thumbs.get("high") or {}).get("url")).strip()
-                new_rows.append({
-                    "channel_id": cid,
-                    "title": title,
-                    "handle": "",
-                    "avatar_url": avatar,
-                    "subscribers": 0,  # scraper sẽ update khi quét channel.stats
-                })
-                existing.add(cid)  # tránh trùng trong cùng run
-                if len(new_rows) >= max_insert:
-                    break
-            if len(new_rows) >= max_insert:
-                break
+    topn = st.slider("Hiển thị Top", 10, 50, 20, 5)
+    show = merged.head(topn).copy()
 
-    except QuotaExceeded as qe:
-        # Không crash: skip discover
-        print(f"[WARN] auto_discover: quotaExceeded -> skip. {qe}")
-        return 0
+    st.caption("Công thức: Viral_Score = view_count / subscribers (lọc 30 ngày, view>0, Viral_Score ≥ 3.0)")
 
-    new_rows = dedupe_rows(new_rows, "channel_id")
-    if not new_rows:
-        print("[INFO] auto_discover: không tìm thấy kênh mới.")
-        return 0
+    cols_per_row = 4
+    cols = st.columns(cols_per_row)
+    for i, row in enumerate(show.to_dict("records")):
+        c = cols[i % cols_per_row]
+        with c:
+            vid = row["video_id"]
+            title = (row.get("title") or "").strip()
+            channel_title = (row.get("channel_title") or row.get("handle") or row.get("channel_id") or "").strip()
+            subs = int(row.get("subscribers") or 0)
+            views = int(row.get("view_count") or 0)
+            score = float(row.get("viral_score") or 0.0)
 
-    upsert_channels(client, new_rows, dry_run=False)  # auto discover luôn ghi
-    print(f"[INFO] auto_discover: inserted {len(new_rows)} channels.")
-    return len(new_rows)
+            thumb = yt_thumb(vid)
+            url = yt_url(vid)
+
+            st.markdown('<div class="tw-card">', unsafe_allow_html=True)
+            st.markdown(f'<div class="tw-thumb-wrap"><img src="{thumb}" style="width:100%; display:block; aspect-ratio:16/9; object-fit:cover;">'
+                        f'<div class="tw-badge-top"><span>🔥 {score:.1f}x</span></div></div>', unsafe_allow_html=True)
+            safe_title = (title[:68] + "…") if len(title) > 69 else title
+            st.markdown('<div class="body">', unsafe_allow_html=True)
+            st.markdown(f'<div class="tw-title">{safe_title}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="tw-sub">{channel_title} • {fmt_int(subs)} subs</div>', unsafe_allow_html=True)
+            st.markdown('<div class="tw-metrics">', unsafe_allow_html=True)
+            st.markdown(f'<span class="tw-chip good">👁️ {fmt_int(views)} views</span>', unsafe_allow_html=True)
+            st.markdown(f'<span class="tw-chip">🆔 {vid}</span>', unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown(f'<div style="margin-top:10px;"><a href="{url}" target="_blank" style="color:#93c5fd; text-decoration:none; font-weight:700;">Mở video →</a></div>', unsafe_allow_html=True)
+            st.markdown('</div></div>', unsafe_allow_html=True)
 
 
 # -----------------------------
-# Main scan logic
+# Tab 2 — Detailed Channel Analysis (old UI moved here)
 # -----------------------------
-async def scan_one_channel(
-    session: aiohttp.ClientSession,
-    pool: ApiKeyPool,
-    client: Client,
-    channel_id: str,
-    cfg: Cfg,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    ch_item = await yt_channels(session, pool, channel_id)
-    if not ch_item:
-        return [], [], []
+def tab_channel_detail(ch_df: pd.DataFrame, vid_df: pd.DataFrame, snaps_df: pd.DataFrame, rpm_long: float, rpm_shorts: float):
+    st.subheader("📊 Phân tích Kênh chi tiết")
 
-    snippet = ch_item.get("snippet") or {}
-    stats = ch_item.get("statistics") or {}
-    content = ch_item.get("contentDetails") or {}
-    rel = (content.get("relatedPlaylists") or {})
-    uploads_pid = safe_str(rel.get("uploads")).strip()
+    if ch_df.empty:
+        st.info("Chưa có kênh trong bảng channels. Hãy thêm kênh ở Sidebar.")
+        return
 
-    channels_rows = [{
-        "channel_id": channel_id,
-        "title": safe_str(snippet.get("title")),
-        "handle": safe_str(snippet.get("customUrl")),
-        "avatar_url": safe_str(((snippet.get("thumbnails") or {}).get("default") or {}).get("url")),
-        "subscribers": to_int(stats.get("subscriberCount")),
-    }]
+    # Channel picker (Sidebar selection moved logically here but still in sidebar is fine)
+    options = [f"{r.get('title') or r.get('handle') or r.get('channel_id')} • {r.get('channel_id')}" for _, r in ch_df.iterrows()]
+    pick = st.selectbox("Chọn kênh để phân tích", options=options)
+    channel_id = pick.split("•")[-1].strip()
 
-    video_ids: List[str] = []
-    if uploads_pid:
-        video_ids = await yt_playlist_items_video_ids(session, pool, uploads_pid, limit=cfg.max_videos_per_channel)
+    ch_row = ch_df[ch_df["channel_id"] == channel_id]
+    ch_title = (ch_row["title"].iloc[0] if not ch_row.empty else "") or channel_id
+    ch_subs = int(ch_row["subscribers"].iloc[0] if not ch_row.empty else 0)
 
-    v_items = await yt_videos(session, pool, video_ids)
+    # Filter videos
+    vch = vid_df[vid_df["channel_id"] == channel_id].copy()
+    if vch.empty:
+        st.warning("Kênh này chưa có video trong bảng videos (scraper chưa ghi).")
+        return
 
-    videos_rows: List[Dict[str, Any]] = []
-    snapshots_rows: List[Dict[str, Any]] = []
-    now_iso = utc_now().isoformat()
-    gemini_key = cfg.gemini_api_key or ""
+    # Pull snapshots for these video_ids (from snaps_df already fetched recent)
+    vids = vch["video_id"].dropna().astype(str).tolist()
+    ss = snaps_df[snaps_df["video_id"].isin(vids)].copy()
+    if ss.empty:
+        st.warning("Chưa có snapshots cho các video của kênh này.")
+        return
 
-    for it in v_items:
-        vid = safe_str(it.get("id")).strip()
-        if not vid:
-            continue
-        vs = it.get("snippet") or {}
-        vt = safe_str(vs.get("title"))
-        vd = safe_str(vs.get("description"))
-        published_at = safe_str(vs.get("publishedAt"))
+    # Latest per video
+    ss_latest = latest_snapshot_per_video(ss)
 
-        niche = ""
-        sentiment = ""
-        if gemini_key:
-            niche, sentiment = await analyze_video_with_ai(session, gemini_key, vt, vd)
+    # Merge
+    m = vch.merge(ss_latest, on="video_id", how="left")
+    m["view_count"] = pd.to_numeric(m["view_count"], errors="coerce").fillna(0).astype(int)
+    m["like_count"] = pd.to_numeric(m["like_count"], errors="coerce").fillna(0).astype(int)
+    m["comment_count"] = pd.to_numeric(m["comment_count"], errors="coerce").fillna(0).astype(int)
 
-        videos_rows.append({
-            "video_id": vid,
-            "channel_id": channel_id,
-            "published_at": published_at,
-            "title": vt,
-            "description": vd,
-            "tags_json": json.dumps(vs.get("tags") or [], ensure_ascii=False),
-            "niche": niche,
-            "sentiment": sentiment,
-        })
+    # 30-day deltas (approx): per video latest - earliest in last 30 days
+    cutoff = pd.Timestamp(now_utc() - timedelta(days=30))
+    ss30 = ss[ss["captured_at"].notna() & (ss["captured_at"] >= cutoff)].copy()
+    delta_views = 0
+    delta_likes = 0
+    delta_comments = 0
+    if not ss30.empty:
+        # for each video, earliest and latest within 30 days
+        ss30_sorted = ss30.sort_values(["video_id", "captured_at"])
+        first = ss30_sorted.groupby("video_id", as_index=False).first()[["video_id", "view_count", "like_count", "comment_count"]]
+        last = ss30_sorted.groupby("video_id", as_index=False).last()[["video_id", "view_count", "like_count", "comment_count"]]
+        dv = last.merge(first, on="video_id", suffixes=("_last", "_first"), how="inner")
+        dv["dv"] = (dv["view_count_last"] - dv["view_count_first"]).clip(lower=0)
+        dv["dl"] = (dv["like_count_last"] - dv["like_count_first"]).clip(lower=0)
+        dv["dc"] = (dv["comment_count_last"] - dv["comment_count_first"]).clip(lower=0)
+        delta_views = int(dv["dv"].sum())
+        delta_likes = int(dv["dl"].sum())
+        delta_comments = int(dv["dc"].sum())
 
-        stt = it.get("statistics") or {}
-        snapshots_rows.append({
-            "video_id": vid,
-            "captured_at": now_iso,
-            "view_count": to_int(stt.get("viewCount")),
-            "like_count": to_int(stt.get("likeCount")),
-            "comment_count": to_int(stt.get("commentCount")),
-        })
+    total_views_now = int(m["view_count"].sum())
+    total_likes_now = int(m["like_count"].sum())
+    total_comments_now = int(m["comment_count"].sum())
 
-    return channels_rows, videos_rows, snapshots_rows
+    # Revenue estimate (simple): delta_views/1000 * rpm_long (we don't truly know shorts split)
+    est_revenue_30d = (delta_views / 1000.0) * float(rpm_long)
+
+    # Header
+    st.markdown(
+        f"""
+        <div class="tw-top">
+          <div class="tw-pill">📌 {ch_title}</div>
+          <div class="tw-badges">
+            <div class="tw-badge">subs: <b>{fmt_int(ch_subs)}</b></div>
+            <div class="tw-badge">videos(DB): <b>{len(vch)}</b></div>
+            <div class="tw-badge">snapshots(DB): <b>{len(ss)}</b></div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    # KPI Row (like NexLev tiles)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown('<div class="tw-card"><div class="body">', unsafe_allow_html=True)
+        st.markdown(f'<div class="kpi-label">Doanh thu ước tính (30 ngày)</div><div class="kpi-value">{fmt_money(est_revenue_30d)}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="tw-sub">RPM video dài: {rpm_long:.2f}</div>', unsafe_allow_html=True)
+        st.markdown('</div></div>', unsafe_allow_html=True)
+    with c2:
+        st.markdown('<div class="tw-card"><div class="body">', unsafe_allow_html=True)
+        st.markdown(f'<div class="kpi-label">Views tăng (30 ngày, trong DB)</div><div class="kpi-value">{fmt_int(delta_views)}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="tw-sub">Tổng views hiện tại (trong DB): {fmt_int(total_views_now)}</div>', unsafe_allow_html=True)
+        st.markdown('</div></div>', unsafe_allow_html=True)
+    with c3:
+        st.markdown('<div class="tw-card"><div class="body">', unsafe_allow_html=True)
+        st.markdown(f'<div class="kpi-label">RPM (ước tính)</div><div class="kpi-value">{fmt_money(rpm_long)}</div>', unsafe_allow_html=True)
+        st.markdown('<div class="tw-sub">Shorts RPM chỉ để tham khảo.</div>', unsafe_allow_html=True)
+        st.markdown('</div></div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="tw-divider"></div>', unsafe_allow_html=True)
+
+    # Gap filler tiles (the "empty space" you pointed out)
+    st.markdown("#### Thông số nhanh (tính từ DB)")
+    st.markdown('<div class="tw-tiles">', unsafe_allow_html=True)
+    tiles = [
+        ("👁️ Tổng views (DB)", fmt_int(total_views_now)),
+        ("👍 Tổng likes (DB)", fmt_int(total_likes_now)),
+        ("💬 Tổng comments (DB)", fmt_int(total_comments_now)),
+        ("📈 Views tăng 30 ngày", fmt_int(delta_views)),
+        ("👍 Likes tăng 30 ngày", fmt_int(delta_likes)),
+        ("💬 Comments tăng 30 ngày", fmt_int(delta_comments)),
+        ("💵 Doanh thu ước tính 30 ngày", fmt_money(est_revenue_30d)),
+        ("🧾 Số video (DB)", str(len(vch))),
+    ]
+    for t, v in tiles:
+        st.markdown(f'<div class="tw-tile"><div class="t">{t}</div><div class="v">{v}</div></div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="tw-divider"></div>', unsafe_allow_html=True)
+
+    # Time series chart: sum views across videos per captured_at
+    st.markdown("#### Biểu đồ tăng trưởng (tổng views theo snapshot)")
+    ts = ss.copy()
+    ts = ts[ts["captured_at"].notna()].copy()
+    if ts.empty:
+        st.info("Không đủ dữ liệu snapshots để vẽ chart.")
+    else:
+        ts = ts.groupby("captured_at", as_index=False)["view_count"].sum().sort_values("captured_at")
+        st.line_chart(ts.set_index("captured_at")["view_count"])
+
+    st.markdown('<div class="tw-divider"></div>', unsafe_allow_html=True)
+
+    # Video list like NexLev card grid (smaller)
+    st.markdown("#### Video (trong DB)")
+    q = st.text_input("Tìm theo tiêu đề", value="", placeholder="Search…")
+    sort_key = st.selectbox("Sắp xếp", ["Mới nhất", "Nhiều view"], index=0)
+    per_page = st.selectbox("Hiển thị", [12, 24, 48], index=2)
+
+    mm = m.copy()
+    if q.strip():
+        mm = mm[mm["title"].str.contains(q.strip(), case=False, na=False)]
+    if sort_key == "Nhiều view":
+        mm = mm.sort_values("view_count", ascending=False)
+    else:
+        mm = mm.sort_values("published_at", ascending=False)
+
+    show = mm.head(int(per_page)).copy()
+
+    if show.empty:
+        st.info("Không có video khớp filter.")
+        return
+
+    cols = st.columns(4)
+    for i, row in enumerate(show.to_dict("records")):
+        c = cols[i % 4]
+        with c:
+            vid = row["video_id"]
+            title = (row.get("title") or "").strip()
+            views = int(row.get("view_count") or 0)
+            likes = int(row.get("like_count") or 0)
+            cmts = int(row.get("comment_count") or 0)
+
+            # Viral badge uses channel subs (current)
+            score = (views / ch_subs) if ch_subs > 0 else 0.0
+            badge = f"🔥 {score:.1f}x" if score >= 3.0 else "✅"
+
+            st.markdown('<div class="tw-card">', unsafe_allow_html=True)
+            st.markdown(f'<div class="tw-thumb-wrap"><img src="{yt_thumb(vid)}" style="width:100%; display:block; aspect-ratio:16/9; object-fit:cover;">'
+                        f'<div class="tw-badge-top" style="border-color:rgba(34,197,94,.45); background:rgba(34,197,94,.12)"><span>{badge}</span></div></div>', unsafe_allow_html=True)
+            safe_title = (title[:60] + "…") if len(title) > 61 else title
+            st.markdown('<div class="body">', unsafe_allow_html=True)
+            st.markdown(f'<div class="tw-title">{safe_title}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="tw-sub">{fmt_int(views)} views • {fmt_int(likes)} likes • {fmt_int(cmts)} cmts</div>', unsafe_allow_html=True)
+            st.markdown(f'<div><a href="{yt_url(vid)}" target="_blank" style="color:#93c5fd; text-decoration:none; font-weight:700;">Mở video →</a></div>', unsafe_allow_html=True)
+            st.markdown('</div></div>', unsafe_allow_html=True)
 
 
-async def run_async(cfg: Cfg) -> None:
-    pool = ApiKeyPool(cfg.youtube_keys)
-    client = supa(cfg)
-
-    timeout = aiohttp.ClientTimeout(total=55)
-    sem = asyncio.Semaphore(cfg.concurrency)
-
-    upsert_scraper_state(client, {
-        "id": 1,
-        "status": "running",
-        "message": "Starting…",
-        "updated_at": utc_now().isoformat(),
-        "run_started_at": utc_now().isoformat(),
-        "progress": 0,
-        "pct": 0,
-    }, dry_run=cfg.dry_run)
-
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        # ✅ Auto-discover ngay đầu run
-        try:
-            added = await auto_discover_new_channels(session, pool, client, max_insert=50)
-            if added:
-                upsert_scraper_state(client, {
-                    "id": 1,
-                    "status": "running",
-                    "message": f"Auto-discover added {added} channels",
-                    "updated_at": utc_now().isoformat(),
-                }, dry_run=cfg.dry_run)
-        except Exception as e:
-            print(f"[WARN] auto_discover failed (ignored): {e}")
-
-        # Load channels AFTER discover
-        channel_ids = list_channels_to_scan(client, limit=cfg.max_channels_per_run)
-        if not channel_ids:
-            print("[INFO] Không có kênh nào trong bảng channels.")
-            upsert_scraper_state(client, {
-                "id": 1,
-                "status": "ok",
-                "message": "No channels to scan",
-                "updated_at": utc_now().isoformat(),
-            }, dry_run=cfg.dry_run)
-            return
-
-        all_ch: List[Dict[str, Any]] = []
-        all_v: List[Dict[str, Any]] = []
-        all_s: List[Dict[str, Any]] = []
-
-        async def worker(ch_id: str):
-            async with sem:
-                return await scan_one_channel(session, pool, client, ch_id, cfg)
-
-        tasks = [asyncio.create_task(worker(cid)) for cid in channel_ids]
-        done = 0
-
-        for fut in asyncio.as_completed(tasks):
-            try:
-                ch_rows, v_rows, s_rows = await fut
-                all_ch.extend(ch_rows)
-                all_v.extend(v_rows)
-                all_s.extend(s_rows)
-            except QuotaExceeded as qe:
-                upsert_scraper_state(client, {
-                    "id": 1,
-                    "status": "quota_exhausted",
-                    "message": str(qe)[:500],
-                    "updated_at": utc_now().isoformat(),
-                }, dry_run=cfg.dry_run)
-                raise
-            except Exception as e:
-                print(f"[WARN] scan channel fail: {e}")
-            finally:
-                done += 1
-                if done % 2 == 0 or done == len(channel_ids):
-                    upsert_scraper_state(client, {
-                        "id": 1,
-                        "status": "running",
-                        "message": f"Scanning... {done}/{len(channel_ids)}",
-                        "updated_at": utc_now().isoformat(),
-                        "progress": done,
-                        "pct": int(done / max(1, len(channel_ids)) * 100),
-                    }, dry_run=cfg.dry_run)
-
-        print(f"[INFO] channels={len(all_ch)} videos={len(all_v)} snapshots={len(all_s)}")
-        upsert_channels(client, all_ch, dry_run=cfg.dry_run)
-        upsert_videos(client, all_v, dry_run=cfg.dry_run)
-        insert_snapshots(client, all_s, dry_run=cfg.dry_run)
-
-    upsert_scraper_state(client, {
-        "id": 1,
-        "status": "ok",
-        "message": "Done",
-        "updated_at": utc_now().isoformat(),
-        "last_run_at": utc_now().isoformat(),
-        "progress": len(channel_ids),
-        "pct": 100,
-    }, dry_run=cfg.dry_run)
-
-
+# -----------------------------
+# Main
+# -----------------------------
 def main():
-    cfg = load_cfg()
-    if not cfg.youtube_keys:
-        raise RuntimeError("Thiếu YouTube API key. Set YOUTUBE_API_KEYS hoặc YOUTUBE_API_KEY.")
-    try:
-        asyncio.run(run_async(cfg))
-    except QuotaExceeded as qe:
-        print("[FATAL] quotaExceeded -> dừng an toàn.")
-        print(f"[FATAL] {qe}")
-        raise SystemExit(2)
+    # Top header
+    st.markdown(
+        f"""
+        <div class="tw-top">
+          <div class="tw-pill">toolwatch • NexLev-style</div>
+          <div class="tw-badges">
+            <div class="tw-badge">Frontend only</div>
+            <div class="tw-badge">No YouTube API</div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    # Load data once
+    ch_df = fetch_channels()
+    vid_df = fetch_videos(limit=5000)
+    snaps_df = fetch_snapshots_recent(limit=50000)
+    snap_latest = latest_snapshot_per_video(snaps_df)
+
+    rpm_long, rpm_shorts = sidebar_controls(ch_df)
+
+    # Two big tabs
+    tab1, tab2 = st.tabs(["🏠 Trang chủ (Outlier Radar)", "📊 Phân tích Kênh chi tiết"])
+
+    with tab1:
+        tab_outlier_radar(ch_df, vid_df, snap_latest)
+
+    with tab2:
+        tab_channel_detail(ch_df, vid_df, snaps_df, rpm_long=rpm_long, rpm_shorts=rpm_shorts)
 
 
 if __name__ == "__main__":
